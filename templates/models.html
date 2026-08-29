@@ -1,0 +1,36 @@
+<div class="page-controls">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span class="muted" style="font-size:9.5px;letter-spacing:0.1em;font-weight:600">SORT BY</span>
+    <div class="seg" id="sortSeg"></div>
+    <span class="muted" id="mModelsCount" style="font-size:11px"></span>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <div class="seg" id="grpSeg"></div>
+    <div class="seg" id="rngSeg"></div>
+  </div>
+</div>
+
+<div class="metric-strip" id="topCards"></div>
+
+<div class="models-grid">
+  <div class="panel" style="padding:8px 12px">
+    <table class="data-table" id="modelTable">
+      <thead>
+        <tr>
+          <th class="m-rank">#</th>
+          <th>Model</th>
+          <th class="share-cell">Share</th>
+          <th style="width:84px">Activity</th>
+          <th class="num">Tokens</th>
+          <th class="num">Share</th>
+          <th class="num">Sess</th>
+          <th class="num">Avg t/s</th>
+        </tr>
+      </thead>
+      <tbody id="modelTableBody"></tbody>
+    </table>
+  </div>
+  <div class="panel" id="selPanel">
+    <div class="empty">select a model</div>
+  </div>
+</div>

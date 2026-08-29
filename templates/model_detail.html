@@ -1,0 +1,56 @@
+<div class="page-controls">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap" id="mdlHead"></div>
+  <div class="seg" id="mdlRange"></div>
+</div>
+
+<div class="metric-strip cols-5" id="mdlCards"></div>
+
+<div class="ov-charts">
+  <div class="panel">
+    <div class="panel-head"><b>Time accounting</b><span class="muted" id="mdlAccSub"></span></div>
+    <div class="stackbar" id="mdlAccBar" style="height:9px"></div>
+    <div class="legend" id="mdlAccLegend"></div>
+    <div class="panel-head" style="margin-top:14px"><b>Tokens per bucket</b></div>
+    <div class="chart-box" id="mdlTokChart"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><b>Launch configuration</b><span class="muted" id="mdlCfgSub"></span></div>
+    <table class="kv" id="mdlCfg"></table>
+    <details class="cfg-details">
+      <summary>Full launch flags</summary>
+      <pre class="flags-box" id="mdlFlags"></pre>
+    </details>
+    <div id="mdlCfgHistWrap" style="margin-top:12px">
+      <div class="panel-head"><b>Config history</b><span class="muted">distinct observed launch configs</span></div>
+      <table class="data-table">
+        <thead>
+          <tr><th>Fingerprint</th><th>First seen</th><th class="num">Ctx</th><th class="num">KV k</th><th class="num">MTP</th><th class="num">Threads</th></tr>
+        </thead>
+        <tbody id="mdlCfgHistBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="ov-charts-2">
+  <div class="panel">
+    <div class="panel-head"><b>Speed</b><span class="muted">prompt vs generation t/s</span></div>
+    <div class="chart-box" id="mdlSpeed"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><b>Context</b><span class="muted">tokens in use</span></div>
+    <div class="chart-box" id="mdlCtx"></div>
+  </div>
+</div>
+
+<div class="ov-charts-2">
+  <div class="panel">
+    <div class="panel-head"><b>MTP acceptance</b><span class="muted">% of proposed tokens kept</span></div>
+    <div class="chart-box short" id="mdlMtp"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><b>Hardware</b><span class="muted">GPU util % / VRAM MB</span></div>
+    <div class="chart-box short" id="mdlHw"></div>
+    <div id="mdlGpuCards"></div>
+  </div>
+</div>

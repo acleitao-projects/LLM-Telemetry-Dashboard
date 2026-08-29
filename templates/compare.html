@@ -1,0 +1,22 @@
+<div class="page-controls">
+  <div class="muted" style="font-size:11px;max-width:640px">
+    Pick up to five already-observed sessions. Nothing is executed — compare only.
+    Best value per row is highlighted; deltas follow selection order.
+  </div>
+</div>
+
+<div style="display:grid;grid-template-columns:340px 1fr;gap:12px;align-items:start">
+  <div class="panel">
+    <div class="panel-head"><b>Candidates</b><span class="muted" id="cmpCount"></span></div>
+    <div class="cmp-pick" id="cmpPick"></div>
+  </div>
+  <div>
+    <div class="panel" id="cmpTablePanel">
+      <div id="cmpTable"><div class="empty">pick up to five sessions on the left — nothing is executed, observed sessions only</div></div>
+    </div>
+    <div class="panel" style="margin-top:12px" id="cmpDeltaPanel" hidden>
+      <div class="panel-head"><b>Deltas</b><span class="muted">in selection order</span></div>
+      <div id="cmpDeltas"></div>
+    </div>
+  </div>
+</div>
