@@ -1278,6 +1278,12 @@ def run_retention():
 
 
 def _bucketize(s: Session, old_cut: int, new_cut: int, bucket_ms: int):
+    pending = s.exec(select(TelemetrySample.id).where(
+        TelemetrySample.ts >= old_cut, TelemetrySample.ts < new_cut,
+        (TelemetrySample.ts % bucket_ms) != 0,
+    ).limit(1)).first()
+    if pending is None:
+        return
     rows = s.exec(select(TelemetrySample).where(
         TelemetrySample.ts >= old_cut, TelemetrySample.ts < new_cut)).all()
     if not rows:
@@ -1300,27 +1306,30 @@ def _bucketize(s: Session, old_cut: int, new_cut: int, bucket_ms: int):
                 if getattr(x, attr) is not None and getattr(x, attr) > 0]
         return sum(vals) / len(vals) if vals else None
 
-    ins = sqlite_insert(TelemetrySample)
+    values = []
     for (pid, mid, b), rs in groups.items():
         rs.sort(key=lambda r: r.ts)
         last = rs[-1]
-        s.exec(ins.values(
-            provider_id=pid, model_id=mid, ts=b, state=last.state,
-            tokens_total=_mx(rs, "tokens_total"), prompt_total=_mx(rs, "prompt_total"),
-            gen_total=_mx(rs, "gen_total"),
-            prompt_seconds_total=_mx(rs, "prompt_seconds_total"),
-            gen_seconds_total=_mx(rs, "gen_seconds_total"),
-            mtp_proposed_total=_mx(rs, "mtp_proposed_total"),
-            mtp_accepted_total=_mx(rs, "mtp_accepted_total"),
-            prompt_tps=_av_positive(rs, "prompt_tps"),
-            gen_tps=_av_positive(rs, "gen_tps"),
-            context_used=_mx(rs, "context_used"), context_max=_mx(rs, "context_max"),
-            mtp_acc=_av(rs, "mtp_acc"), gpu_util=_av(rs, "gpu_util"),
-            vram_used_mb=_av(rs, "vram_used_mb"), vram_total_mb=_mx(rs, "vram_total_mb"),
-            gpu_temp=_av(rs, "gpu_temp"), gpu_power_w=_av(rs, "gpu_power_w"),
-            cpu_pct=_av(rs, "cpu_pct"), ram_used_mb=_av(rs, "ram_used_mb"),
-            power_w=_av(rs, "power_w"), session_id=last.session_id, extra=None,
-        ).on_conflict_do_nothing(index_elements=["provider_id", "model_id", "ts"]))
+        values.append({
+            "provider_id": pid, "model_id": mid, "ts": b, "state": last.state,
+            "tokens_total": _mx(rs, "tokens_total"),
+            "prompt_total": _mx(rs, "prompt_total"), "gen_total": _mx(rs, "gen_total"),
+            "prompt_seconds_total": _mx(rs, "prompt_seconds_total"),
+            "gen_seconds_total": _mx(rs, "gen_seconds_total"),
+            "mtp_proposed_total": _mx(rs, "mtp_proposed_total"),
+            "mtp_accepted_total": _mx(rs, "mtp_accepted_total"),
+            "prompt_tps": _av_positive(rs, "prompt_tps"),
+            "gen_tps": _av_positive(rs, "gen_tps"),
+            "context_used": _mx(rs, "context_used"),
+            "context_max": _mx(rs, "context_max"), "mtp_acc": _av(rs, "mtp_acc"),
+            "gpu_util": _av(rs, "gpu_util"), "vram_used_mb": _av(rs, "vram_used_mb"),
+            "vram_total_mb": _mx(rs, "vram_total_mb"), "gpu_temp": _av(rs, "gpu_temp"),
+            "gpu_power_w": _av(rs, "gpu_power_w"), "cpu_pct": _av(rs, "cpu_pct"),
+            "ram_used_mb": _av(rs, "ram_used_mb"), "power_w": _av(rs, "power_w"),
+            "session_id": last.session_id, "extra": None,
+        })
+    s.execute(sqlite_insert(TelemetrySample).on_conflict_do_nothing(
+        index_elements=["provider_id", "model_id", "ts"]), values)
     s.commit()
     s.exec(delete(TelemetrySample).where(
         TelemetrySample.ts >= old_cut, TelemetrySample.ts < new_cut,
@@ -1329,6 +1338,12 @@ def _bucketize(s: Session, old_cut: int, new_cut: int, bucket_ms: int):
 
 
 def _bucketize_gpu(s: Session, old_cut: int, new_cut: int, bucket_ms: int):
+    pending = s.exec(select(GpuTelemetrySample.id).where(
+        GpuTelemetrySample.ts >= old_cut, GpuTelemetrySample.ts < new_cut,
+        (GpuTelemetrySample.ts % bucket_ms) != 0,
+    ).limit(1)).first()
+    if pending is None:
+        return
     rows = s.exec(select(GpuTelemetrySample).where(
         GpuTelemetrySample.ts >= old_cut, GpuTelemetrySample.ts < new_cut)).all()
     groups: dict[tuple, list[GpuTelemetrySample]] = {}
@@ -1340,6 +1355,7 @@ def _bucketize_gpu(s: Session, old_cut: int, new_cut: int, bucket_ms: int):
         vals = [getattr(item, attr) for item in items if getattr(item, attr) is not None]
         return sum(vals) / len(vals) if vals else None
 
+    values = []
     for (pid, key, bucket), items in groups.items():
         items.sort(key=lambda item: item.ts)
         last = items[-1]
@@ -1347,15 +1363,19 @@ def _bucketize_gpu(s: Session, old_cut: int, new_cut: int, bucket_ms: int):
                             for value in json.loads(item.active_model_ids or "[]")})
         session_ids = sorted({value for item in items
                               for value in json.loads(item.active_session_ids or "[]")})
-        s.exec(sqlite_insert(GpuTelemetrySample).values(
-            provider_id=pid, ts=bucket, gpu_key=key, gpu_index=last.gpu_index,
-            gpu_uuid=last.gpu_uuid, name=last.name, util=avg(items, "util"),
-            vram_used_mb=avg(items, "vram_used_mb"),
-            vram_total_mb=avg(items, "vram_total_mb"), temp_c=avg(items, "temp_c"),
-            power_w=avg(items, "power_w"), pcie=last.pcie,
-            active_model_ids=json.dumps(model_ids),
-            active_session_ids=json.dumps(session_ids),
-        ).on_conflict_do_nothing(index_elements=["provider_id", "gpu_key", "ts"]))
+        values.append({
+            "provider_id": pid, "ts": bucket, "gpu_key": key,
+            "gpu_index": last.gpu_index, "gpu_uuid": last.gpu_uuid,
+            "name": last.name, "util": avg(items, "util"),
+            "vram_used_mb": avg(items, "vram_used_mb"),
+            "vram_total_mb": avg(items, "vram_total_mb"),
+            "temp_c": avg(items, "temp_c"), "power_w": avg(items, "power_w"),
+            "pcie": last.pcie, "active_model_ids": json.dumps(model_ids),
+            "active_session_ids": json.dumps(session_ids),
+        })
+    if values:
+        s.execute(sqlite_insert(GpuTelemetrySample).on_conflict_do_nothing(
+            index_elements=["provider_id", "gpu_key", "ts"]), values)
     s.commit()
     s.exec(delete(GpuTelemetrySample).where(
         GpuTelemetrySample.ts >= old_cut, GpuTelemetrySample.ts < new_cut,

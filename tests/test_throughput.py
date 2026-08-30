@@ -27,6 +27,43 @@ def memory_engine():
 
 
 class ThroughputCalculationTests(unittest.TestCase):
+    def test_native_aggregate_matches_python_accumulator(self):
+        engine = memory_engine()
+        samples = [
+            TelemetrySample(provider_id=1, model_id=1, ts=10_000, state="IDLE",
+                            tokens_total=0, prompt_total=0, gen_total=0,
+                            prompt_seconds_total=0, gen_seconds_total=0),
+            TelemetrySample(provider_id=1, model_id=2, ts=20_000, state="IDLE",
+                            tokens_total=10, prompt_total=10, gen_total=0),
+            TelemetrySample(provider_id=1, model_id=1, ts=30_000, state="GENERATING",
+                            tokens_total=100, prompt_total=20, gen_total=80,
+                            prompt_seconds_total=2, gen_seconds_total=4,
+                            gen_tps=20, context_used=2048),
+            TelemetrySample(provider_id=1, model_id=2, ts=40_000, state="IDLE",
+                            tokens_total=5, prompt_total=2, gen_total=3,
+                            mtp_proposed_total=10, mtp_accepted_total=7),
+            TelemetrySample(provider_id=1, model_id=1, ts=50_000, state="IDLE",
+                            tokens_total=120, prompt_total=20, gen_total=100,
+                            prompt_seconds_total=2, gen_seconds_total=5,
+                            gen_tps=25, context_used=4096),
+        ]
+        with Session(engine) as session:
+            session.add_all(samples)
+            session.commit()
+            ordered = list(session.exec(select(TelemetrySample).order_by(
+                TelemetrySample.ts)).all())
+            expected: dict[int, ModelAcc] = {}
+            accumulate(ordered, expected, 0, 100_000, 100_000)
+            actual = metrics.aggregate_samples(session, [1], 0, 100_000, 100_000)
+
+        self.assertEqual(set(actual), set(expected))
+        for model_id in expected:
+            for field in ("tokens", "prompt_tokens", "gen_tokens", "d_proposed",
+                          "d_accepted", "prompt_time", "gen_time", "loaded_time",
+                          "idle_time", "peak_gen", "peak_prompt", "context_max"):
+                self.assertAlmostEqual(getattr(actual[model_id], field),
+                                       getattr(expected[model_id], field))
+
     def test_accumulate_interleaved_models_is_linear_and_preserves_tails(self):
         class CountingSample:
             model_id_reads = 0
