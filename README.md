@@ -1,5 +1,16 @@
 # LLM-Telemetry
 
+> This was built using Qwen 3.8 27B and Codex. The code was not reviewed and was designed to run on a closed network.
+>
+> Use at your own risk. If something breaks, explodes, leaks memory, summons a daemon, or generally behaves in ways that disappoint you, I’ll be expecting your PR.
+>
+> As a very wise developer once said:
+>
+> “It runs on my machine.”
+
+> [!WARNING]
+> LLM-Telemetry has no authentication. Do not expose it directly to the public internet; keep it on a trusted closed network or place it behind an authenticated reverse proxy.
+
 Passive observability dashboard for llama.cpp servers. It watches one or more
 llama.cpp endpoints (plus an optional host agent) **read-only** and turns the
 stream into a dense, dark, technical dashboard: which models did the work,
