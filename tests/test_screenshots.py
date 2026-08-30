@@ -19,6 +19,53 @@ PNG_1X1 = base64.b64decode(
 
 
 class ScreenshotTests(unittest.TestCase):
+    def test_capture_assets_are_cache_busted(self):
+        template_path = os.path.join(app.BASE_DIR, "templates", "base.html")
+        with open(template_path, encoding="utf-8") as source:
+            template = source.read()
+
+        self.assertIn('/static/css/app.css?v=', template)
+        self.assertIn('/static/js/app.js?v=', template)
+
+    def test_selected_model_uses_stable_wide_capture_layout(self):
+        script_path = os.path.join(app.BASE_DIR, "static", "js", "app.js")
+        with open(script_path, encoding="utf-8") as source:
+            script = source.read()
+
+        self.assertIn('data-capture-width="600"', script)
+        self.assertIn("capturePanelAtWidth", script)
+
+    def test_capture_uuid_has_plain_http_fallback(self):
+        script_path = os.path.join(app.BASE_DIR, "static", "js", "app.js")
+        with open(script_path, encoding="utf-8") as source:
+            script = source.read()
+
+        self.assertIn('typeof crypto.randomUUID === "function"', script)
+        self.assertIn("crypto.getRandomValues(new Uint8Array(16))", script)
+        self.assertIn("const captureId = newCaptureId()", script)
+
+    def test_selected_gauge_capture_preserves_ratio_and_detail_clearance(self):
+        css_path = os.path.join(app.BASE_DIR, "static", "css", "app.css")
+        with open(css_path, encoding="utf-8") as source:
+            css = source.read()
+        selector = ".runtime-context .resource-gauge svg"
+        start = css.index(selector)
+        rule = css[start:css.index("}", start)]
+
+        self.assertIn("aspect-ratio: 100 / 84", rule)
+        self.assertIn("margin: -6px auto 4px", rule)
+        self.assertNotIn(".runtime-layout { grid-template-columns: 1fr; }", css)
+
+    def test_default_capture_directory_follows_database_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = os.path.join(directory, "observatory.db")
+            with patch.object(app, "SCREENSHOT_DIR", None), patch.object(
+                app.odb, "get_db_path", return_value=db_path
+            ):
+                self.assertEqual(
+                    app._screenshot_dir(), os.path.join(directory, "screenshots")
+                )
+
     def test_png_upload_wait_redirect_and_image_response(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(app, "SCREENSHOT_DIR", directory):
             capture_id = str(uuid4())

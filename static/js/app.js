@@ -132,6 +132,13 @@ async function capturePanel(target) {
 
   const drawSvg = async (element, rect, opacity) => {
     const clone = element.cloneNode(true);
+    // Blob-loaded SVGs otherwise fall back to a 300x150 intrinsic viewport.
+    // Drawing that fallback bitmap into the CSS box distorts circles and text.
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    clone.setAttribute("width", String(rect.width));
+    clone.setAttribute("height", String(rect.height));
+    clone.style.width = rect.width + "px";
+    clone.style.height = rect.height + "px";
     const sourceNodes = [element, ...element.querySelectorAll("*")];
     const clonedNodes = [clone, ...clone.querySelectorAll("*")];
     const svgProperties = [
@@ -255,20 +262,62 @@ async function capturePanel(target) {
   return canvas.toDataURL("image/png");
 }
 
+function afterCaptureLayout() {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+function newCaptureId() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+  return hex.slice(0, 4).join("") + "-" + hex.slice(4, 6).join("") + "-" +
+    hex.slice(6, 8).join("") + "-" + hex.slice(8, 10).join("") + "-" +
+    hex.slice(10).join("");
+}
+
+async function capturePanelAtWidth(target, width) {
+  if (!width) return capturePanel(target);
+  const original = {
+    width: target.style.width,
+    minWidth: target.style.minWidth,
+    maxWidth: target.style.maxWidth,
+  };
+  target.style.width = width + "px";
+  target.style.minWidth = width + "px";
+  target.style.maxWidth = "none";
+  try {
+    await afterCaptureLayout();
+    window.dispatchEvent(new Event("resize"));
+    await afterCaptureLayout();
+    return await capturePanel(target);
+  } finally {
+    target.style.width = original.width;
+    target.style.minWidth = original.minWidth;
+    target.style.maxWidth = original.maxWidth;
+    await afterCaptureLayout();
+    window.dispatchEvent(new Event("resize"));
+  }
+}
+
 document.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-capture-target]");
   if (!button) return;
   event.stopPropagation();
   event.preventDefault();
   const tabName = "telemetry-capture-" + Date.now();
-  const captureId = crypto.randomUUID();
+  const captureId = newCaptureId();
   const waitUrl = "/screenshots/" + captureId + "/wait";
   button.href = waitUrl;
   button.target = tabName;
   const captureTab = window.open(waitUrl, tabName);
   button.classList.add("is-capturing");
   try {
-    const pngUrl = await capturePanel(document.getElementById(button.dataset.captureTarget));
+    const requestedWidth = Math.max(0, Number(button.dataset.captureWidth) || 0);
+    const pngUrl = await capturePanelAtWidth(
+      document.getElementById(button.dataset.captureTarget), requestedWidth,
+    );
     const png = await (await fetch(pngUrl)).blob();
     const response = await fetch("/api/screenshots/" + captureId, {
       method: "PUT", headers: { "Content-Type": "image/png" }, body: png,
@@ -768,6 +817,7 @@ function initModels(meta) {
         '<div class="sel-head"><span class="m-dot" style="background:' + esc(s.color) + '"></span>' +
         '<span class="tag">SELECTED</span><span class="sel-name">' + esc(s.label) + '</span>' +
         '<a class="capture-btn" href="about:blank" target="_blank" data-capture-target="selPanel" data-capture-name="selected-model" ' +
+        'data-capture-width="600" ' +
         'data-capture-ignore aria-label="Capture selected model card as an image">CAPTURE</a></div>' +
         '<div class="mc-sub" style="margin-top:2px">' + esc(s.provider || "") + " · range " + st.range + "</div>" +
         '<div id="selRuntime">' + runtimeHtml(s.realtime) + "</div>" +
