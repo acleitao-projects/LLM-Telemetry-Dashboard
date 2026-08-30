@@ -61,7 +61,9 @@ for old_release in "${OLD_RELEASES[@]}"; do
   resolved_old_release=$(readlink -f "${old_release}")
   if [[ ${resolved_old_release} == "${RELEASES_DIR}/"* \
     && $(readlink -f "${APP_ROOT}/current") != "${resolved_old_release}" ]]; then
-    sudo rm -rf -- "${resolved_old_release}"
+    if ! rm -rf -- "${resolved_old_release}"; then
+      echo "Warning: could not fully remove old release ${resolved_old_release}." >&2
+    fi
   fi
 done
 
