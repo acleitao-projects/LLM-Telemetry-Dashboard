@@ -78,8 +78,11 @@ function selMetric(l, v, s) {
 async function capturePanel(target) {
   if (!target) throw new Error("Capture target is unavailable");
   const rootRect = target.getBoundingClientRect();
-  const width = Math.ceil(Math.max(target.scrollWidth, rootRect.width));
-  const height = Math.ceil(Math.max(target.scrollHeight, rootRect.height));
+  const captureWidth = Math.ceil(Math.max(target.scrollWidth, rootRect.width));
+  const captureHeight = Math.ceil(Math.max(target.scrollHeight, rootRect.height));
+  const padding = 1;
+  const width = captureWidth + padding * 2;
+  const height = captureHeight + padding * 2;
   const scale = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
   const canvas = document.createElement("canvas");
   canvas.width = Math.ceil(width * scale);
@@ -87,13 +90,9 @@ async function capturePanel(target) {
   const context = canvas.getContext("2d");
   context.scale(scale, scale);
 
-  const rootStyle = getComputedStyle(target);
-  context.fillStyle = rootStyle.backgroundColor || "#1b1b19";
-  context.fillRect(0, 0, width, height);
-
   const relativeRect = (rect) => ({
-    x: rect.left - rootRect.left + target.scrollLeft,
-    y: rect.top - rootRect.top + target.scrollTop,
+    x: rect.left - rootRect.left + target.scrollLeft + padding,
+    y: rect.top - rootRect.top + target.scrollTop + padding,
     width: rect.width,
     height: rect.height,
   });
@@ -222,10 +221,37 @@ async function capturePanel(target) {
     }
   };
 
+  const rootStyle = getComputedStyle(target);
+  const rootRadius = Math.max(
+    parseFloat(rootStyle.borderTopLeftRadius) || 0,
+    parseFloat(rootStyle.borderTopRightRadius) || 0,
+    parseFloat(rootStyle.borderBottomRightRadius) || 0,
+    parseFloat(rootStyle.borderBottomLeftRadius) || 0,
+  );
+  const rootBox = { x: padding, y: padding, width: captureWidth, height: captureHeight };
+  context.save();
+  pathBox(rootBox, rootRadius);
+  context.clip();
+  context.fillStyle = rootStyle.backgroundColor && rootStyle.backgroundColor !== "rgba(0, 0, 0, 0)" ?
+    rootStyle.backgroundColor : "#1b1b19";
+  context.fillRect(rootBox.x, rootBox.y, rootBox.width, rootBox.height);
   for (const child of target.childNodes) {
     if (child.nodeType === Node.ELEMENT_NODE) await drawElement(child, 1);
     else if (child.nodeType === Node.TEXT_NODE) drawText(child, 1);
   }
+  const rootBorderWidth = parseFloat(rootStyle.borderTopWidth) || 0;
+  if (rootBorderWidth && rootStyle.borderTopStyle !== "none") {
+    context.strokeStyle = rootStyle.borderTopColor;
+    context.lineWidth = rootBorderWidth;
+    pathBox({
+      x: rootBox.x + rootBorderWidth / 2,
+      y: rootBox.y + rootBorderWidth / 2,
+      width: rootBox.width - rootBorderWidth,
+      height: rootBox.height - rootBorderWidth,
+    }, Math.max(0, rootRadius - rootBorderWidth / 2));
+    context.stroke();
+  }
+  context.restore();
   return canvas.toDataURL("image/png");
 }
 
@@ -670,13 +696,13 @@ function initModels(meta) {
         live.processing ? "warming up" : "—") +
       item("tg 3s", live.gen_tps_3s != null ? live.gen_tps_3s.toFixed(2) + " t/s" :
         live.processing ? "warming up" : "—") +
-      item("observed", age) + '</div>' + (live.session_id != null ?
-        '<div class="runtime-chart-key"><span><i class="runtime-key-tps"></i>TK/S</span>' +
-        '<span><i class="runtime-key-context"></i>CONTEXT</span></div>' +
-        '<div class="runtime-chart" id="runtimeChart" role="img" aria-label="Generated tokens per second and context size across the current session"></div>' : "") +
-      '</div><div class="runtime-context">' +
+      item("observed", age) + '</div></div><div class="runtime-context">' +
       resourceGauge("CONTEXT", live.context_pct, ctxCenter, ctxDetail, "Context " + ctxDetail) +
-      '</div></div></div>';
+      '</div></div>' + (live.session_id != null ?
+        '<div class="runtime-history"><div class="runtime-chart-key"><span><i class="runtime-key-tps"></i>TK/S</span>' +
+        '<span><i class="runtime-key-context"></i>CONTEXT</span></div>' +
+        '<div class="runtime-chart" id="runtimeChart" role="img" aria-label="Generated tokens per second and context size across the current session"></div></div>' : "") +
+      '</div>';
   };
 
   const renderRuntimeChart = () => {
@@ -686,7 +712,7 @@ function initModels(meta) {
     runtimeChart.setOption({
       animation: false,
       backgroundColor: "transparent",
-      grid: { left: 30, right: 38, top: 3, bottom: 2 },
+      grid: { left: 1, right: 1, top: 2, bottom: 0 },
       tooltip: {
         trigger: "axis", backgroundColor: "#1e1e1b", borderColor: OC.border,
         borderWidth: 1, padding: [5, 8], textStyle: { color: OC.text, fontSize: 10 },
@@ -696,20 +722,20 @@ function initModels(meta) {
         data: runtimeSeries.timestamps.map((ts) => fmtClock(ts, true)),
       },
       yAxis: [
-        { type: "value", scale: true, splitNumber: 1, splitLine: { lineStyle: { color: OC.split } },
-          axisLine: { show: false }, axisTick: { show: false },
-          axisLabel: { color: OC.orange, fontSize: 8, formatter: (v) => Number(v).toFixed(0) } },
-        { type: "value", scale: true, splitNumber: 1, splitLine: { show: false },
-          axisLine: { show: false }, axisTick: { show: false },
-          axisLabel: { color: OC.text, fontSize: 8, formatter: (v) => fmtTokens(v) } },
+        { type: "value", scale: true, show: false },
+        { type: "value", scale: true, show: false },
       ],
       series: [
         { name: "tk/s", type: "line", yAxisIndex: 0, data: runtimeSeries.genTps,
-          showSymbol: false, smooth: 0.12, connectNulls: false,
-          lineStyle: { width: 1.35, color: OC.orange }, itemStyle: { color: OC.orange } },
+          showSymbol: false, smooth: 0.2, connectNulls: false,
+          lineStyle: { width: 1.25, color: OC.orange }, itemStyle: { color: OC.orange },
+          areaStyle: { color: OC.orange + "26" },
+          tooltip: { valueFormatter: (v) => v == null ? "—" : Number(v).toFixed(1) + " t/s" } },
         { name: "context", type: "line", yAxisIndex: 1, data: runtimeSeries.context,
-          showSymbol: false, smooth: 0.12, connectNulls: false,
-          lineStyle: { width: 1, color: OC.text }, itemStyle: { color: OC.text } },
+          showSymbol: false, smooth: 0.2, connectNulls: false,
+          lineStyle: { width: 1.15, color: OC.green }, itemStyle: { color: OC.green },
+          areaStyle: { color: OC.green + "20" },
+          tooltip: { valueFormatter: (v) => v == null ? "—" : fmtNum(v) + " tokens" } },
       ],
     });
   };
