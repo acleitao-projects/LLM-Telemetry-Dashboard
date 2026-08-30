@@ -35,6 +35,15 @@ class ScreenshotTests(unittest.TestCase):
         self.assertIn('data-capture-width="600"', script)
         self.assertIn("capturePanelAtWidth", script)
 
+    def test_capture_uuid_has_plain_http_fallback(self):
+        script_path = os.path.join(app.BASE_DIR, "static", "js", "app.js")
+        with open(script_path, encoding="utf-8") as source:
+            script = source.read()
+
+        self.assertIn('typeof crypto.randomUUID === "function"', script)
+        self.assertIn("crypto.getRandomValues(new Uint8Array(16))", script)
+        self.assertIn("const captureId = newCaptureId()", script)
+
     def test_selected_gauge_capture_preserves_ratio_and_detail_clearance(self):
         css_path = os.path.join(app.BASE_DIR, "static", "css", "app.css")
         with open(css_path, encoding="utf-8") as source:
