@@ -1,0 +1,48 @@
+<div class="ov-top">
+  <div class="metric-card">
+    <div class="mc-label">NOW</div>
+    <div class="mc-value" id="ovNowState" style="font-size:14px;padding-top:7px">—</div>
+    <div class="mc-sub" id="ovNowModel">no model loaded</div>
+    <div class="mc-sub" id="ovNowSub"></div>
+  </div>
+  <div class="metric-card">
+    <div class="mc-label">TODAY TOKENS</div>
+    <div class="mc-value" id="ovTokVal">—</div>
+    <div class="mc-sub" id="ovSessSub">—</div>
+  </div>
+  <div class="metric-card">
+    <div class="mc-label">INFERENCE TIME</div>
+    <div class="mc-value" id="ovInfVal">—</div>
+    <div class="mc-sub" id="ovInfSub">—</div>
+  </div>
+  <div class="metric-card">
+    <div class="mc-label">CONTEXT</div>
+    <div class="mc-value" id="ovCtxVal">—</div>
+    <div class="ctx-bar" id="ovCtxBar" style="margin-top:8px"><i style="width:0%"></i></div>
+    <div class="mc-sub" id="ovCtxSub">—</div>
+  </div>
+</div>
+
+<div class="ov-charts">
+  <div class="panel">
+    <div class="panel-head"><b>Tokens by model — last 24h</b><span class="muted">hourly buckets</span></div>
+    <div class="chart-box tall" id="ovUsage"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><b>Inference time by model — 7d</b></div>
+    <div class="chart-box" id="ovInf"></div>
+    <div class="muted" style="font-size:10.5px;margin-top:8px">Inference = prompting + generation time. Idle time is tracked separately and never counts as inference.</div>
+    <div class="panel-head" style="margin-top:12px"><b>Tokens by model — 7d</b></div>
+    <div class="chart-box short" id="ovTok"></div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head"><b>Recent sessions</b><span class="muted">last 10 observed</span></div>
+  <table class="data-table" id="ovRecent">
+    <thead>
+      <tr><th>Started</th><th>Model</th><th class="num">Duration</th><th class="num">Gen tok</th><th class="num">Gen t/s</th><th class="num">MTP</th></tr>
+    </thead>
+    <tbody id="ovRecentBody"></tbody>
+  </table>
+</div>

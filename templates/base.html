@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} · LLM-Telemetry</title>
+<link rel="icon" type="image/png" href="/static/img/llm-telemetry-icon-v2.png">
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body data-page="{{ page }}">
+<div class="app">
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="LLM-Telemetry overview">
+      <img class="brand-logo" src="/static/img/llm-telemetry-logo-v2.png" alt="LLM-Telemetry">
+    </a>
+    <nav>
+      {% set active_map = {"overview": "overview", "models": "models", "model": "models",
+                           "sessions": "sessions", "session": "sessions", "compare": "compare",
+                           "hardware": "hardware", "settings": "settings"} %}
+      {% for key, label, href in nav %}
+      <a href="{{ href }}" class="{{ 'active' if active_map.get(page) == key }}">{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <div class="side-status">
+      <div class="side-prov"><span class="dot" id="sideDot" style="width:7px;height:7px;border-radius:50%;background:#74736e;display:inline-block"></span><span id="sideProv">connecting…</span></div>
+      <div class="side-line"><span>UPTIME</span><b id="sideUp">—</b></div>
+      <div class="side-line"><span>DB</span><b id="sideDb">—</b></div>
+    </div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div>
+        <h1>{{ title }}</h1>
+        {% if subtitle %}<div class="sub">{{ subtitle }}</div>{% endif %}
+      </div>
+      <div class="topbar-right">
+        {% if demo %}<span class="badge badge-demo">DEMO DATA</span>{% endif %}
+        <span class="pill offline" id="provPill"><span class="dot"></span><span id="provPillText">…</span></span>
+      </div>
+    </header>
+    <div class="content">
+      {% include template %}
+    </div>
+  </div>
+</div>
+<script>window.QUERY = {{ query | tojson }};</script>
+<script src="/static/js/echarts.min.js"></script>
+<script src="/static/js/charts.js"></script>
+<script src="/static/js/app.js?v=20260830-runtime-capture-3"></script>
+</body>
+</html>

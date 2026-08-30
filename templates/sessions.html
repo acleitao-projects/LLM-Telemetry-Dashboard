@@ -1,0 +1,33 @@
+<div class="page-controls">
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+    <div class="field" style="width:150px;margin:0"><label>Provider</label><select id="fProvider"></select></div>
+    <div class="field" style="width:190px;margin:0"><label>Model</label><select id="fModel"></select></div>
+    <div class="field" style="width:120px;margin:0"><label>Quant</label><select id="fQuant"></select></div>
+    <div class="field" style="width:130px;margin:0"><label>Reasoning</label>
+      <select id="fReasoning">
+        <option value="">any</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+    </div>
+    <div class="seg" id="sessMtp" style="margin-bottom:1px"></div>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <span class="muted" id="sessCount" style="font-size:11px"></span>
+    <div class="seg" id="sessRange"></div>
+  </div>
+</div>
+
+<div class="panel" style="padding:8px 12px">
+  <table class="data-table" id="sessTable">
+    <thead>
+      <tr>
+        <th>Started</th><th></th><th>Model</th><th>Provider</th><th>Quant</th>
+        <th class="num">Duration</th><th class="num">Prompt tok</th><th class="num">Gen tok</th>
+        <th class="num">Prompt t/s</th><th class="num">Gen t/s</th><th class="num">MTP</th><th>Status</th>
+      </tr>
+    </thead>
+    <tbody id="sessBody"></tbody>
+  </table>
+</div>

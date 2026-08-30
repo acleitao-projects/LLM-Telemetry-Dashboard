@@ -1,0 +1,35 @@
+<div id="sdHead" class="sd-head"></div>
+
+<div class="metric-strip cols-5" id="sdCards"></div>
+
+<div class="ov-charts">
+  <div class="panel">
+    <div class="panel-head"><b>Speed over time</b><span class="muted">prompt vs generation t/s</span></div>
+    <div class="chart-box tall" id="sdSpeed"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><b>Context</b><span class="muted">tokens in use</span></div>
+    <div class="chart-box tall" id="sdCtx"></div>
+  </div>
+</div>
+
+<div class="ov-charts-2">
+  <div class="panel">
+    <div class="panel-head"><b>MTP acceptance</b><span class="muted">%</span></div>
+    <div class="chart-box short" id="sdMtp"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><b>Hardware</b><span class="muted">GPU util % / VRAM MB</span></div>
+    <div class="chart-box short" id="sdHw"></div>
+    <div id="sdGpuCards"></div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head"><b>Launch configuration</b><span class="muted" id="sdCfgSub"></span></div>
+  <table class="kv" id="sdCfg"></table>
+  <details class="cfg-details">
+    <summary>Full launch flags</summary>
+    <pre class="flags-box" id="sdFlags"></pre>
+  </details>
+</div>

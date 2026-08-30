@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.log
+data/screenshots/
+.env
+.env.*
+!.env.example
+.coverage
+htmlcov/
+.pytest_cache/
+node_modules/
