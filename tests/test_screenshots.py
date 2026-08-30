@@ -19,6 +19,16 @@ PNG_1X1 = base64.b64decode(
 
 
 class ScreenshotTests(unittest.TestCase):
+    def test_default_capture_directory_follows_database_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = os.path.join(directory, "observatory.db")
+            with patch.object(app, "SCREENSHOT_DIR", None), patch.object(
+                app.odb, "get_db_path", return_value=db_path
+            ):
+                self.assertEqual(
+                    app._screenshot_dir(), os.path.join(directory, "screenshots")
+                )
+
     def test_png_upload_wait_redirect_and_image_response(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(app, "SCREENSHOT_DIR", directory):
             capture_id = str(uuid4())
