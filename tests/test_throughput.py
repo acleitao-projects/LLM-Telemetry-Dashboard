@@ -197,10 +197,14 @@ class ThroughputCalculationTests(unittest.TestCase):
             ))
             session.commit()
 
-            page = metrics.models_page(session, provider.id, "today", "family")
-            selected = metrics.selected_stats(
-                session, [model.id], provider.id, "today",
-            )
+            with patch.object(
+                metrics, "fetch_samples",
+                side_effect=AssertionError("Models summaries must use projected rows"),
+            ):
+                page = metrics.models_page(session, provider.id, "today", "family")
+                selected = metrics.selected_stats(
+                    session, [model.id], provider.id, "today",
+                )
             detail = metrics.model_detail(session, model.id, "24h")
             session_data = metrics.session_detail(session, run.id)
             compared = metrics.compare(session, [run.id])

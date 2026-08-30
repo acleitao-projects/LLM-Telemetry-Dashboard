@@ -32,8 +32,18 @@ from observatory.settings import (DB_PATH_DEFAULT, DB_PATH_DEMO, NAUTILUS_AGENT_
 log = logging.getLogger("observatory")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SCREENSHOT_DIR = os.path.join(BASE_DIR, "data", "screenshots")
+SCREENSHOT_DIR = os.environ.get("LLM_TELEMETRY_SCREENSHOT_DIR")
 SCREENSHOT_TTL_S = 24 * 60 * 60
+
+
+def _screenshot_dir() -> str:
+    """Keep captures beside the configured database unless explicitly overridden."""
+    if SCREENSHOT_DIR:
+        return SCREENSHOT_DIR
+    db_path = odb.get_db_path()
+    if db_path:
+        return os.path.join(os.path.dirname(os.path.abspath(db_path)), "screenshots")
+    return os.path.join(BASE_DIR, "data", "screenshots")
 
 
 def _screenshot_path(capture_id: str) -> str:
@@ -43,13 +53,14 @@ def _screenshot_path(capture_id: str) -> str:
         raise HTTPException(status_code=404, detail="Screenshot not found")
     if normalized != capture_id.lower():
         raise HTTPException(status_code=404, detail="Screenshot not found")
-    return os.path.join(SCREENSHOT_DIR, normalized + ".png")
+    return os.path.join(_screenshot_dir(), normalized + ".png")
 
 
 def _cleanup_screenshots(now: float | None = None) -> None:
-    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    screenshot_dir = _screenshot_dir()
+    os.makedirs(screenshot_dir, exist_ok=True)
     cutoff = (time.time() if now is None else now) - SCREENSHOT_TTL_S
-    for entry in os.scandir(SCREENSHOT_DIR):
+    for entry in os.scandir(screenshot_dir):
         if not entry.is_file() or not entry.name.endswith((".png", ".tmp")):
             continue
         try:
@@ -152,7 +163,7 @@ def create_app(demo: bool = False) -> FastAPI:
             return Response("Screenshot is too large", status_code=413)
         if not image.startswith(b"\x89PNG\r\n\x1a\n"):
             return Response("Invalid PNG screenshot", status_code=400)
-        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        os.makedirs(_screenshot_dir(), exist_ok=True)
         temporary = path + ".tmp"
         with open(temporary, "wb") as output:
             output.write(image)

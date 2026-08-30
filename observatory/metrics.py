@@ -506,8 +506,9 @@ class OverviewSample(NamedTuple):
 
 
 def fetch_overview_samples(s: Session, prov_ids: list[int],
-                           start_ms: int) -> list[OverviewSample]:
-    """Load the seven-day overview window without materializing full ORM objects."""
+                           start_ms: int, end_ms: Optional[int] = None,
+                           model_ids: Optional[list[int]] = None) -> list[OverviewSample]:
+    """Load aggregation fields without materializing full ORM objects."""
     q = select(
         TelemetrySample.model_id,
         TelemetrySample.ts,
@@ -525,7 +526,12 @@ def fetch_overview_samples(s: Session, prov_ids: list[int],
     ).where(
         TelemetrySample.provider_id.in_(prov_ids),
         TelemetrySample.ts >= start_ms,
-    ).order_by(TelemetrySample.ts)
+    )
+    if end_ms is not None:
+        q = q.where(TelemetrySample.ts <= end_ms)
+    if model_ids:
+        q = q.where(TelemetrySample.model_id.in_(model_ids))
+    q = q.order_by(TelemetrySample.ts)
     return [OverviewSample(*row) for row in s.exec(q).all()]
 
 
@@ -804,7 +810,7 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
         return {"rows": [], "top": {}}
     models = list(s.exec(select(Model).where(Model.provider_id.in_(prov_ids))).all())
     m_by_id = {m.id: m for m in models}
-    samples = fetch_samples(s, prov_ids, start)
+    samples = fetch_overview_samples(s, prov_ids, start)
     acc: dict[int, ModelAcc] = {}
     accumulate(samples, acc, start, now, now)
     sess = sessions_in_range(s, prov_ids, start)
@@ -893,7 +899,8 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
             fastest = (r["label"], r["peak_gen"])
 
     prev_start = start - max(1, now - start)
-    prev_samples = fetch_samples(s, prov_ids, prev_start, start) if start > 1 else []
+    prev_samples = (fetch_overview_samples(s, prov_ids, prev_start, start)
+                    if start > 1 else [])
     prev_acc: dict[int, ModelAcc] = {}
     if prev_samples:
         accumulate(prev_samples, prev_acc, prev_start, start, start)
@@ -928,7 +935,7 @@ def selected_stats(s: Session, model_ids: list[int], provider_id: Optional[int],
     provs = list(s.exec(select(Provider)).all())
     prov_ids = [p.id for p in provs if p.id == provider_id] if provider_id else [p.id for p in provs]
     models = {m.id: m for m in s.exec(select(Model).where(Model.id.in_(model_ids))).all()}
-    samples = fetch_samples(s, prov_ids, start, model_ids=model_ids)
+    samples = fetch_overview_samples(s, prov_ids, start, model_ids=model_ids)
     acc: dict[int, ModelAcc] = {}
     accumulate(samples, acc, start, now, now)
     sess = sessions_in_range(s, prov_ids, start, model_ids=model_ids)
@@ -942,22 +949,12 @@ def selected_stats(s: Session, model_ids: list[int], provider_id: Optional[int],
     mtp_acc = (mtp_accepted / mtp_proposed * 100.0) if mtp_proposed > 0 else None
     peak_gen = max((a.peak_gen for a in acc.values()), default=0.0)
     peak_prompt = max((a.peak_prompt for a in acc.values()), default=0.0)
-    total_all = 0.0
-    all_acc: dict[int, ModelAcc] = {}
-    all_samples = fetch_samples(s, prov_ids, start)
-    accumulate(all_samples, all_acc, start, now, now)
+    all_acc = aggregate_samples(s, prov_ids, start, now, now)
     total_all = sum(a.tokens for a in all_acc.values())
-    span = max(1, now - start)
     spark = [0.0] * SPARK_BUCKETS
-    prev = None
-    for r in samples:
-        if prev is not None and r.model_id == prev.model_id:
-            d = _delta(r, prev, "tokens_total")
-            if d == 0:
-                d = _delta(r, prev, "prompt_total") + _delta(r, prev, "gen_total")
-            b = min(SPARK_BUCKETS - 1, int((prev.ts - start) * SPARK_BUCKETS / span))
-            spark[max(0, b)] += d
-        prev = r
+    for item in acc.values():
+        for index, value in enumerate(item.spark):
+            spark[index] += value
     m = models.get(model_ids[0])
     live_items = [_model_live(s, model_id, now) for model_id in model_ids]
     live_items = [item for item in live_items if item]

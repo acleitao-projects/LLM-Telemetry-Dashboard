@@ -132,6 +132,13 @@ async function capturePanel(target) {
 
   const drawSvg = async (element, rect, opacity) => {
     const clone = element.cloneNode(true);
+    // Blob-loaded SVGs otherwise fall back to a 300x150 intrinsic viewport.
+    // Drawing that fallback bitmap into the CSS box distorts circles and text.
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    clone.setAttribute("width", String(rect.width));
+    clone.setAttribute("height", String(rect.height));
+    clone.style.width = rect.width + "px";
+    clone.style.height = rect.height + "px";
     const sourceNodes = [element, ...element.querySelectorAll("*")];
     const clonedNodes = [clone, ...clone.querySelectorAll("*")];
     const svgProperties = [
