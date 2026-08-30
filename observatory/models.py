@@ -201,6 +201,8 @@ class SessionRow(SQLModel, table=True):
     live_gen_tokens: Optional[float] = None
     live_context: Optional[int] = None
     live_gen_tps: Optional[float] = None
+    live_gen_tps_avg: Optional[float] = None
+    live_gen_tps_3s: Optional[float] = None
     live_seen_at: Optional[int] = Field(default=None, index=True)
     result_source: Optional[str] = None      # metrics / slots / incomplete
     created_at: int = Field(default_factory=now_ms)

@@ -38,6 +38,7 @@ COUNTER_KEYS = ("tokens_total", "prompt_total", "gen_total",
 MTP_WINDOW_S = 30.0
 LIVE_FINALIZE_GRACE_S = 10.0
 LIVE_SPEED_WINDOW_S = 8.0
+LIVE_SHORT_WINDOW_S = 3.0
 LEASE_STALE_MS = 10_000
 LEASE_RETRY_S = 2.0
 
@@ -800,6 +801,8 @@ class Collector:
             gen_tokens = float(snap.get("gen_tokens") or 0)
             if task.speed_points and gen_tokens < task.speed_points[-1][1]:
                 task.speed_points.clear()
+                task.generation_started_at = None
+                task.generation_start_tokens = 0.0
             task.speed_points.append((now, gen_tokens))
             task.speed_points = [(t, value) for t, value in task.speed_points
                                  if now - t <= LIVE_SPEED_WINDOW_S]
@@ -809,6 +812,23 @@ class Collector:
                 dt = now - t0
                 if dt > 0 and gen_tokens >= v0:
                     live_tps = (gen_tokens - v0) / dt
+            if task.generation_started_at is None and gen_tokens > 0:
+                task.generation_started_at = now
+                task.generation_start_tokens = gen_tokens
+            live_tps_avg = None
+            if task.generation_started_at is not None:
+                elapsed = now - task.generation_started_at
+                generated = gen_tokens - task.generation_start_tokens
+                if elapsed > 0 and generated >= 0:
+                    live_tps_avg = generated / elapsed
+            short_points = [(t, value) for t, value in task.speed_points
+                            if now - t <= LIVE_SHORT_WINDOW_S]
+            live_tps_3s = None
+            if len(short_points) >= 2:
+                short_t0, short_v0 = short_points[0]
+                short_dt = now - short_t0
+                if short_dt > 0 and gen_tokens >= short_v0:
+                    live_tps_3s = (gen_tokens - short_v0) / short_dt
             task.prompt_tokens = float(snap.get("prompt_tokens") or 0)
             task.gen_tokens = gen_tokens
             task.context = snap.get("context")
@@ -820,6 +840,8 @@ class Collector:
                 row.live_gen_tokens = task.gen_tokens
                 row.live_context = task.context
                 row.live_gen_tps = live_tps
+                row.live_gen_tps_avg = live_tps_avg
+                row.live_gen_tps_3s = live_tps_3s
                 row.live_seen_at = ts_ms
                 s.add(row)
             st.last_activity_ts = now
@@ -845,6 +867,8 @@ class Collector:
                         row.live_gen_tokens = None
                         row.live_context = None
                         row.live_gen_tps = None
+                        row.live_gen_tps_avg = None
+                        row.live_gen_tps_3s = None
                     s.add(row)
                 st.live_tasks.pop(key, None)
 
@@ -1088,6 +1112,8 @@ class Collector:
         sess.live_gen_tokens = None
         sess.live_context = None
         sess.live_gen_tps = None
+        sess.live_gen_tps_avg = None
+        sess.live_gen_tps_3s = None
         st.active_session_id = None
         st.stats = None
         st.last_activity_ts = None

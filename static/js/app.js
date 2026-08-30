@@ -346,6 +346,28 @@ function initModels(meta) {
     ch.spark(el("topSpark"), spark, OC.blue);
   };
 
+  const liveTimingHtml = (live) => {
+    if (!live || !live.processing) {
+      return '<div class="live-timing"><div class="live-timing-head"><span>REAL-TIME TIMING</span>' +
+        '<span class="muted">IDLE</span></div><div class="live-timing-note">No active inference for this selection.</div></div>';
+    }
+    const item = (label, value) => '<span class="live-timing-item"><i>' + esc(label) + '</i><b>' +
+      esc(value == null ? "—" : value) + "</b></span>";
+    return '<div class="live-timing"><div class="live-timing-head"><span>REAL-TIME TIMING</span>' +
+      '<span class="live-badge">● LIVE</span></div><div class="live-timing-grid">' +
+      item("slot", live.slot_id) + item("task", live.task_id) +
+      item("n_gen", fmtNum(live.gen_tokens || 0)) +
+      item("tg avg", live.gen_tps_avg != null ? live.gen_tps_avg.toFixed(2) + " t/s" : "warming up") +
+      item("tg 3s", live.gen_tps_3s != null ? live.gen_tps_3s.toFixed(2) + " t/s" : "warming up") +
+      item("context", live.context != null ? fmtNum(live.context) : "—") +
+      '</div><div class="live-timing-note">Slot-observed and provisional; completed totals still come from /metrics.</div></div>';
+  };
+
+  const updateLiveTiming = (live) => {
+    const target = el("selLiveTiming");
+    if (target) target.innerHTML = liveTimingHtml(live);
+  };
+
   const renderSelected = (row) => {
     const box = el("selPanel");
     if (!row) { box.innerHTML = '<div class="empty">select a model</div>'; return; }
@@ -380,7 +402,8 @@ function initModels(meta) {
         '<i style="width:' + (gt / tot * 100) + "%;background:" + OC.green + '"></i></div>' +
         '<div class="legend"><span><i style="background:' + OC.amber + '"></i>prompt ' + fmtTokens(pt) +
         '</span><span><i style="background:' + OC.green + '"></i>generated ' + fmtTokens(gt) + "</span></div>" +
-        '<div id="selSpark" style="width:100%;height:34px;margin-top:10px"></div>';
+        '<div id="selSpark" style="width:100%;height:34px;margin-top:10px"></div>' +
+        '<div id="selLiveTiming">' + liveTimingHtml(live) + "</div>";
       if (selChart) { try { selChart.dispose(); } catch (e) {} selChart = null; }
       selChart = sparkline(el("selSpark"), s.spark || [0], s.color);
     });
@@ -451,6 +474,14 @@ function initModels(meta) {
     st.sort = METRIC_KEYS.find((k) => METRIC_LABELS[k] === lbl) || "inference";
     renderTable();
   });
+
+  window.__onLive = (d) => {
+    const current = d && d.current;
+    const row = st.rows.find((r) => r.key === st.selectedKey);
+    const selectedIsCurrent = current && row && row.model_ids &&
+      row.model_ids.includes(current.model_id);
+    updateLiveTiming(selectedIsCurrent ? current.live : null);
+  };
 
   load().then(render);
 }

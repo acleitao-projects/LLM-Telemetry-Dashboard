@@ -220,7 +220,7 @@ class ThroughputMigrationTests(unittest.TestCase):
             version = session.exec(text(
                 "SELECT value FROM meta WHERE key='schema_version'"
             )).one()[0]
-            self.assertEqual(version, "4")
+            self.assertEqual(version, "5")
             self.assertEqual(run.gen_time_s, 60)
             self.assertEqual(run.avg_gen_tps, 50)
             self.assertEqual(run.peak_gen_tps, 50)

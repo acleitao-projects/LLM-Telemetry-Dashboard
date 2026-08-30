@@ -72,6 +72,34 @@ class SlotSessionTests(unittest.TestCase):
         }])
         self.assertNotIn("params", parsed[0])
 
+    def test_live_timing_exposes_observed_average_and_three_second_rate(self):
+        engine = memory_engine()
+        collector = Collector(lambda _: None)
+        now = time.time()
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="model", name="model")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            state = ProviderState(model_id=model.id, model_key=model.key)
+            for elapsed, decoded in ((0, 100), (1, 108), (4, 132)):
+                collector._sync_live_tasks(
+                    session, provider, state, {},
+                    _slot_snapshots(live_slot(decoded)),
+                    int((now + elapsed) * 1000), now + elapsed,
+                )
+            session.expire_all()
+            run = session.exec(select(SessionRow)).one()
+            self.assertAlmostEqual(run.live_gen_tps_avg, 8.0)
+            self.assertAlmostEqual(run.live_gen_tps_3s, 8.0)
+            live = metrics._session_live(run, int((now + 4) * 1000))
+            self.assertEqual(live["gen_tps_avg"], 8.0)
+            self.assertEqual(live["gen_tps_3s"], 8.0)
+
     def test_completion_reconciles_metrics_without_adding_live_tokens(self):
         engine = memory_engine()
         client = SequenceClient()

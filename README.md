@@ -48,7 +48,8 @@ verify the whole pipeline end to end.
   model together), **Each file**, or **Quant**; range Today … All; sort by
   **Inference / Loaded / Idle** time. Six summary cards, a ranking table with
   share bars and activity sparklines, and a selected-model panel (tokens,
-  generated %, sessions, peaks, prompt-vs-generated split).
+  generated %, sessions, peaks, prompt-vs-generated split) with live slot
+  timing (`n_gen`, observed `tg`, and rolling `tg 3s`).
 - **Model detail** — live state, time accounting (prompt / generation / idle
   stacked over loaded time), token buckets, prompt vs generation speed,
   context, MTP acceptance, hardware; the full observed launch configuration

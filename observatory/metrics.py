@@ -41,6 +41,10 @@ def _session_live(row: Optional[SessionRow], now: int) -> Optional[dict]:
         "gen_tokens": round(row.live_gen_tokens or 0),
         "context": row.live_context,
         "gen_tps": round(row.live_gen_tps, 1) if row.live_gen_tps is not None else None,
+        "gen_tps_avg": (round(row.live_gen_tps_avg, 2)
+                        if row.live_gen_tps_avg is not None else None),
+        "gen_tps_3s": (round(row.live_gen_tps_3s, 2)
+                       if row.live_gen_tps_3s is not None else None),
         "observed_at": row.live_seen_at,
         "provisional": True,
     }

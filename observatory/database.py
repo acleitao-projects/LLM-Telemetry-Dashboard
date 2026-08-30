@@ -10,7 +10,7 @@ from sqlalchemy.engine import Engine
 
 from . import models  # noqa: F401  (register tables)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _engine: Engine | None = None
 _db_path: str | None = None
@@ -145,6 +145,24 @@ def _migrate(engine: Engine) -> None:
                 ))
                 s.exec(text(
                     "UPDATE meta SET value = '4' WHERE key = 'schema_version'"
+                ))
+                s.commit()
+                version = 4
+            if version < 5:
+                columns = {row[1] for row in s.exec(text(
+                    "PRAGMA table_info(session)"
+                )).all()}
+                additions = {
+                    "live_gen_tps_avg": "FLOAT",
+                    "live_gen_tps_3s": "FLOAT",
+                }
+                for name, sql_type in additions.items():
+                    if name not in columns:
+                        s.exec(text(
+                            f'ALTER TABLE session ADD COLUMN "{name}" {sql_type}'
+                        ))
+                s.exec(text(
+                    "UPDATE meta SET value = '5' WHERE key = 'schema_version'"
                 ))
                 s.commit()
             if version > SCHEMA_VERSION:
