@@ -77,58 +77,180 @@ function selMetric(l, v, s) {
 
 async function capturePanel(target) {
   if (!target) throw new Error("Capture target is unavailable");
-  if (typeof domtoimage === "undefined") throw new Error("Screenshot renderer is unavailable");
-  const width = Math.ceil(Math.max(target.scrollWidth, target.getBoundingClientRect().width));
-  const height = Math.ceil(Math.max(target.scrollHeight, target.getBoundingClientRect().height));
-  const rendering = domtoimage.toPng(target, {
-    bgcolor: getComputedStyle(target).backgroundColor || "#1b1b19",
-    width: width,
-    height: height,
-    cacheBust: true,
-    copyDefaultStyles: true,
-    filter: (node) => !(node.hasAttribute && node.hasAttribute("data-capture-ignore")),
-    onclone: (clonedTarget) => {
-      clonedTarget.style.width = width + "px";
-      clonedTarget.style.height = height + "px";
-      clonedTarget.style.maxWidth = "none";
-      clonedTarget.style.overflow = "visible";
-    },
+  const rootRect = target.getBoundingClientRect();
+  const width = Math.ceil(Math.max(target.scrollWidth, rootRect.width));
+  const height = Math.ceil(Math.max(target.scrollHeight, rootRect.height));
+  const scale = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(width * scale);
+  canvas.height = Math.ceil(height * scale);
+  const context = canvas.getContext("2d");
+  context.scale(scale, scale);
+
+  const rootStyle = getComputedStyle(target);
+  context.fillStyle = rootStyle.backgroundColor || "#1b1b19";
+  context.fillRect(0, 0, width, height);
+
+  const relativeRect = (rect) => ({
+    x: rect.left - rootRect.left + target.scrollLeft,
+    y: rect.top - rootRect.top + target.scrollTop,
+    width: rect.width,
+    height: rect.height,
   });
-  let timer = null;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error("Screenshot rendering exceeded 8 seconds")), 8000);
-  });
-  try {
-    return await Promise.race([rendering, timeout]);
-  } finally {
-    if (timer) clearTimeout(timer);
+
+  const pathBox = (rect, radius) => {
+    context.beginPath();
+    if (context.roundRect) context.roundRect(rect.x, rect.y, rect.width, rect.height, radius);
+    else context.rect(rect.x, rect.y, rect.width, rect.height);
+  };
+
+  const drawText = (node, opacity) => {
+    const parent = node.parentElement;
+    if (!parent || !node.nodeValue || !node.nodeValue.trim()) return;
+    const style = getComputedStyle(parent);
+    const transform = style.textTransform;
+    context.save();
+    context.globalAlpha = opacity;
+    context.fillStyle = style.color;
+    context.font = [style.fontStyle, style.fontWeight, style.fontSize, style.fontFamily].join(" ");
+    context.textBaseline = "top";
+    for (let index = 0; index < node.nodeValue.length; index += 1) {
+      let character = node.nodeValue[index];
+      if (/\s/.test(character)) continue;
+      if (transform === "uppercase") character = character.toUpperCase();
+      else if (transform === "lowercase") character = character.toLowerCase();
+      const range = document.createRange();
+      range.setStart(node, index);
+      range.setEnd(node, index + 1);
+      const rect = range.getBoundingClientRect();
+      if (!rect.width || !rect.height) continue;
+      const point = relativeRect(rect);
+      const fontSize = parseFloat(style.fontSize) || 12;
+      context.fillText(character, point.x, point.y + Math.max(0, (point.height - fontSize) / 2));
+    }
+    context.restore();
+  };
+
+  const drawSvg = async (element, rect, opacity) => {
+    const clone = element.cloneNode(true);
+    const sourceNodes = [element, ...element.querySelectorAll("*")];
+    const clonedNodes = [clone, ...clone.querySelectorAll("*")];
+    const svgProperties = [
+      "color", "fill", "fill-opacity", "stroke", "stroke-width", "stroke-opacity",
+      "stroke-linecap", "stroke-linejoin", "opacity", "font-family", "font-size",
+      "font-style", "font-weight", "letter-spacing", "text-anchor", "dominant-baseline",
+    ];
+    sourceNodes.forEach((sourceNode, index) => {
+      const clonedNode = clonedNodes[index];
+      if (!clonedNode || !clonedNode.style) return;
+      const computed = getComputedStyle(sourceNode);
+      svgProperties.forEach((property) => clonedNode.style.setProperty(property, computed.getPropertyValue(property)));
+    });
+    const source = new XMLSerializer().serializeToString(clone);
+    const url = URL.createObjectURL(new Blob([source], { type: "image/svg+xml;charset=utf-8" }));
+    try {
+      const image = new Image();
+      const loaded = new Promise((resolve) => {
+        image.onload = () => resolve(true);
+        image.onerror = () => resolve(false);
+        setTimeout(() => resolve(false), 1000);
+      });
+      image.src = url;
+      if (await loaded) {
+        context.save();
+        context.globalAlpha = opacity;
+        context.drawImage(image, rect.x, rect.y, rect.width, rect.height);
+        context.restore();
+      }
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  const drawElement = async (element, inheritedOpacity) => {
+    if (element.hasAttribute("data-capture-ignore")) return;
+    const style = getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden") return;
+    const ownOpacity = Number.isFinite(Number(style.opacity)) ? Number(style.opacity) : 1;
+    const opacity = inheritedOpacity * ownOpacity;
+    if (opacity <= 0) return;
+    const rect = relativeRect(element.getBoundingClientRect());
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const radius = parseFloat(style.borderTopLeftRadius) || 0;
+    if (style.backgroundColor && style.backgroundColor !== "rgba(0, 0, 0, 0)") {
+      context.save();
+      context.globalAlpha = opacity;
+      context.fillStyle = style.backgroundColor;
+      pathBox(rect, radius);
+      context.fill();
+      context.restore();
+    }
+    const borderWidth = parseFloat(style.borderTopWidth) || 0;
+    if (borderWidth && style.borderTopStyle !== "none") {
+      context.save();
+      context.globalAlpha = opacity;
+      context.strokeStyle = style.borderTopColor;
+      context.lineWidth = borderWidth;
+      pathBox({ x: rect.x + borderWidth / 2, y: rect.y + borderWidth / 2,
+        width: Math.max(0, rect.width - borderWidth), height: Math.max(0, rect.height - borderWidth) }, radius);
+      context.stroke();
+      context.restore();
+    }
+
+    if (element instanceof HTMLCanvasElement) {
+      context.save();
+      context.globalAlpha = opacity;
+      context.drawImage(element, rect.x, rect.y, rect.width, rect.height);
+      context.restore();
+      return;
+    }
+    if (element instanceof SVGElement && element.tagName.toLowerCase() === "svg") {
+      await drawSvg(element, rect, opacity);
+      return;
+    }
+    if (element instanceof HTMLImageElement && element.complete && element.naturalWidth) {
+      context.save();
+      context.globalAlpha = opacity;
+      context.drawImage(element, rect.x, rect.y, rect.width, rect.height);
+      context.restore();
+      return;
+    }
+    for (const child of element.childNodes) {
+      if (child.nodeType === Node.ELEMENT_NODE) await drawElement(child, opacity);
+      else if (child.nodeType === Node.TEXT_NODE) drawText(child, opacity);
+    }
+  };
+
+  for (const child of target.childNodes) {
+    if (child.nodeType === Node.ELEMENT_NODE) await drawElement(child, 1);
+    else if (child.nodeType === Node.TEXT_NODE) drawText(child, 1);
   }
+  return canvas.toDataURL("image/png");
 }
 
 document.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-capture-target]");
   if (!button) return;
   event.stopPropagation();
+  event.preventDefault();
   const tabName = "telemetry-capture-" + Date.now();
-  button.href = "about:blank";
+  const captureId = crypto.randomUUID();
+  const waitUrl = "/screenshots/" + captureId + "/wait";
+  button.href = waitUrl;
   button.target = tabName;
-  const captureTab = window.open("about:blank", tabName);
-  if (captureTab) {
-    event.preventDefault();
-    captureTab.document.title = "Rendering screenshot…";
-    captureTab.document.body.style.cssText = "margin:0;padding:24px;background:#1b1b19;color:#f1efe9;font:13px system-ui";
-    captureTab.document.body.textContent = "Rendering screenshot…";
-  }
+  const captureTab = window.open(waitUrl, tabName);
   button.classList.add("is-capturing");
   try {
     const pngUrl = await capturePanel(document.getElementById(button.dataset.captureTarget));
-    const destination = captureTab || window.open("", tabName);
-    if (!destination) throw new Error("The browser blocked the screenshot tab");
-    destination.location.replace(pngUrl);
+    const png = await (await fetch(pngUrl)).blob();
+    const response = await fetch("/api/screenshots/" + captureId, {
+      method: "PUT", headers: { "Content-Type": "image/png" }, body: png,
+    });
+    if (!response.ok) throw new Error(await response.text() || "Screenshot upload failed");
   } catch (error) {
     console.error("Screenshot capture failed", error);
-    const destination = captureTab || window.open("", tabName);
-    if (destination) destination.document.body.textContent = "Screenshot failed: " + error.message;
+    if (captureTab) captureTab.location.replace("/models?capture_error=1");
   } finally {
     button.classList.remove("is-capturing");
   }

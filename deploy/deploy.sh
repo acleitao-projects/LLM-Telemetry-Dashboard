@@ -5,7 +5,7 @@ APP_ROOT=/opt/llm-telemetry
 RELEASES_DIR=${APP_ROOT}/releases
 RELEASE_SHA=${RELEASE_SHA:-${GITHUB_SHA:-}}
 SOURCE_DIR=${GITHUB_WORKSPACE:-$(pwd)}
-HEALTH_URL=http://127.0.0.1:8090/api/overview
+HEALTH_URL=http://127.0.0.1:8090/api/meta
 
 if [[ -z ${RELEASE_SHA} || ! ${RELEASE_SHA} =~ ^[0-9a-fA-F]{7,40}$ ]]; then
   echo "RELEASE_SHA must be a Git commit SHA." >&2

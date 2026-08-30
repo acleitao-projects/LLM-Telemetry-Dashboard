@@ -13,9 +13,10 @@ import logging
 import os
 import time
 from typing import Optional
+from uuid import UUID
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, delete, select
@@ -30,6 +31,37 @@ from observatory.settings import (DB_PATH_DEFAULT, DB_PATH_DEMO, NAUTILUS_AGENT_
 log = logging.getLogger("observatory")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SCREENSHOT_DIR = os.path.join(BASE_DIR, "data", "screenshots")
+SCREENSHOT_TTL_S = 24 * 60 * 60
+
+
+def _screenshot_path(capture_id: str) -> str:
+    try:
+        normalized = str(UUID(capture_id))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    if normalized != capture_id.lower():
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    return os.path.join(SCREENSHOT_DIR, normalized + ".png")
+
+
+def _cleanup_screenshots(now: float | None = None) -> None:
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    cutoff = (time.time() if now is None else now) - SCREENSHOT_TTL_S
+    for entry in os.scandir(SCREENSHOT_DIR):
+        if not entry.is_file() or not entry.name.endswith((".png", ".tmp")):
+            continue
+        try:
+            if entry.stat().st_mtime < cutoff:
+                os.remove(entry.path)
+        except FileNotFoundError:
+            pass
+
+
+async def _screenshot_cleanup_loop() -> None:
+    while True:
+        _cleanup_screenshots()
+        await asyncio.sleep(SCREENSHOT_TTL_S)
 
 
 def ensure_default_provider():
@@ -81,6 +113,43 @@ def create_app(demo: bool = False) -> FastAPI:
             "page": "models", "title": "Models",
             "subtitle": "Which models did the work. Group by family to roll quants together.",
             "nav": NAV, "demo": demo, "query": {}, "template": "models.html",
+        })
+
+    @app.put("/api/screenshots/{capture_id}")
+    async def save_screenshot(capture_id: str, request: Request):
+        path = _screenshot_path(capture_id)
+        image = await request.body()
+        if len(image) > 12 * 1024 * 1024:
+            return Response("Screenshot is too large", status_code=413)
+        if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            return Response("Invalid PNG screenshot", status_code=400)
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        temporary = path + ".tmp"
+        with open(temporary, "wb") as output:
+            output.write(image)
+        os.replace(temporary, path)
+        _cleanup_screenshots()
+        return {"url": f"/screenshots/{capture_id}.png"}
+
+    @app.get("/screenshots/{capture_id}/wait")
+    async def wait_for_screenshot(capture_id: str):
+        path = _screenshot_path(capture_id)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if os.path.isfile(path):
+                return RedirectResponse(f"/screenshots/{capture_id}.png", status_code=302)
+            await asyncio.sleep(0.05)
+        return HTMLResponse("Screenshot generation failed or timed out.", status_code=408)
+
+    @app.get("/screenshots/{capture_id}.png")
+    def screenshot_image(capture_id: str):
+        path = _screenshot_path(capture_id)
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="Screenshot not found")
+        return FileResponse(path, media_type="image/png", headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'inline; filename="llm-telemetry-{capture_id}.png"',
+            "X-Content-Type-Options": "nosniff",
         })
 
     @app.get("/model/{mid}", response_class=HTMLResponse)
@@ -317,8 +386,15 @@ def create_app(demo: bool = False) -> FastAPI:
             s.commit()
             return {"display": _display_settings(s)}
 
+    @app.on_event("startup")
+    async def start_screenshot_cleanup():
+        app.state.screenshot_cleanup_task = asyncio.create_task(_screenshot_cleanup_loop())
+
     @app.on_event("shutdown")
     def shutdown_collector():
+        cleanup_task = getattr(app.state, "screenshot_cleanup_task", None)
+        if cleanup_task is not None:
+            cleanup_task.cancel()
         collector = app.state.collector
         if collector is not None:
             collector.stop()
