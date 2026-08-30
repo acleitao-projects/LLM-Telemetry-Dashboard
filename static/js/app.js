@@ -262,6 +262,34 @@ async function capturePanel(target) {
   return canvas.toDataURL("image/png");
 }
 
+function afterCaptureLayout() {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+async function capturePanelAtWidth(target, width) {
+  if (!width) return capturePanel(target);
+  const original = {
+    width: target.style.width,
+    minWidth: target.style.minWidth,
+    maxWidth: target.style.maxWidth,
+  };
+  target.style.width = width + "px";
+  target.style.minWidth = width + "px";
+  target.style.maxWidth = "none";
+  try {
+    await afterCaptureLayout();
+    window.dispatchEvent(new Event("resize"));
+    await afterCaptureLayout();
+    return await capturePanel(target);
+  } finally {
+    target.style.width = original.width;
+    target.style.minWidth = original.minWidth;
+    target.style.maxWidth = original.maxWidth;
+    await afterCaptureLayout();
+    window.dispatchEvent(new Event("resize"));
+  }
+}
+
 document.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-capture-target]");
   if (!button) return;
@@ -275,7 +303,10 @@ document.addEventListener("click", async (event) => {
   const captureTab = window.open(waitUrl, tabName);
   button.classList.add("is-capturing");
   try {
-    const pngUrl = await capturePanel(document.getElementById(button.dataset.captureTarget));
+    const requestedWidth = Math.max(0, Number(button.dataset.captureWidth) || 0);
+    const pngUrl = await capturePanelAtWidth(
+      document.getElementById(button.dataset.captureTarget), requestedWidth,
+    );
     const png = await (await fetch(pngUrl)).blob();
     const response = await fetch("/api/screenshots/" + captureId, {
       method: "PUT", headers: { "Content-Type": "image/png" }, body: png,
@@ -775,6 +806,7 @@ function initModels(meta) {
         '<div class="sel-head"><span class="m-dot" style="background:' + esc(s.color) + '"></span>' +
         '<span class="tag">SELECTED</span><span class="sel-name">' + esc(s.label) + '</span>' +
         '<a class="capture-btn" href="about:blank" target="_blank" data-capture-target="selPanel" data-capture-name="selected-model" ' +
+        'data-capture-width="600" ' +
         'data-capture-ignore aria-label="Capture selected model card as an image">CAPTURE</a></div>' +
         '<div class="mc-sub" style="margin-top:2px">' + esc(s.provider || "") + " · range " + st.range + "</div>" +
         '<div id="selRuntime">' + runtimeHtml(s.realtime) + "</div>" +
