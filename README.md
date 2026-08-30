@@ -46,10 +46,11 @@ verify the whole pipeline end to end.
   7-day inference-time and token leaders, recent sessions.
 - **Models** — the workhorse page. Group by **Family** (rolls quants of one
   model together), **Each file**, or **Quant**; range Today … All; sort by
-  **Inference / Loaded / Idle** time. Six summary cards, a ranking table with
-  share bars and activity sparklines, and a selected-model panel (tokens,
-  generated %, sessions, peaks, prompt-vs-generated split) with live slot
-  timing (`n_gen`, observed `tg`, and rolling `tg 3s`).
+  **Active / Inference / Loaded / Idle** time. Active is the default and supports
+  multiple simultaneous slots. Six summary cards, a ranking table with activity
+  state and sparklines, and a selected-model panel whose top section keeps the
+  latest sanitized runtime snapshot (`n_gen`, observed `tg`, rolling `tg 3s`,
+  and an orange context gauge) separate from authoritative historical totals.
 - **Model detail** — live state, time accounting (prompt / generation / idle
   stacked over loaded time), token buckets, prompt vs generation speed,
   context, MTP acceptance, hardware; the full observed launch configuration
@@ -66,7 +67,8 @@ verify the whole pipeline end to end.
   shared range. Files and quants are aggregated; nothing is executed.
 - **Hardware** — host (CPU/RAM/GPU/driver/PCIe), authoritative llama.cpp build
   version/commit from `/props`, and 1 h per-GPU utilization, VRAM, temperature
-  and power series alongside CPU/RAM. Requires the host agent for host metrics.
+  and power series alongside CPU/RAM. Live GPU cards use separate orange VRAM
+  and utilization gauges for every device. Requires the host agent for host metrics.
 - **Settings** — system status (telemetry availability per metric group),
   provider CRUD with a passive connection test (health/metrics/props/models —
   still no prompts), and display defaults.

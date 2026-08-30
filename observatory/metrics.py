@@ -18,6 +18,12 @@ LIVE_FRESH_MS = 10_000
 FINALIZING_FRESH_MS = 15_000
 
 
+def _bounded_pct(used: Optional[float], total: Optional[float]) -> Optional[float]:
+    if used is None or total is None or total <= 0:
+        return None
+    return round(max(0.0, min(100.0, used / total * 100.0)), 1)
+
+
 def _effective_session_status(row: SessionRow, now: int) -> str:
     if row.status == "ACTIVE":
         if row.live_seen_at is None:
@@ -33,6 +39,7 @@ def _effective_session_status(row: SessionRow, now: int) -> str:
 def _session_live(row: Optional[SessionRow], now: int) -> Optional[dict]:
     if row is None or _effective_session_status(row, now) not in ("ACTIVE", "FINALIZING"):
         return None
+    context_pct = _bounded_pct(row.live_context, row.live_context_max)
     return {
         "processing": row.status == "ACTIVE",
         "slot_id": row.source_slot_id,
@@ -40,6 +47,8 @@ def _session_live(row: Optional[SessionRow], now: int) -> Optional[dict]:
         "prompt_tokens": round(row.live_prompt_tokens or 0),
         "gen_tokens": round(row.live_gen_tokens or 0),
         "context": row.live_context,
+        "context_max": row.live_context_max,
+        "context_pct": context_pct,
         "gen_tps": round(row.live_gen_tps, 1) if row.live_gen_tps is not None else None,
         "gen_tps_avg": (round(row.live_gen_tps_avg, 2)
                         if row.live_gen_tps_avg is not None else None),
@@ -63,6 +72,165 @@ def _model_live(s: Session, model_id: int, now: int) -> Optional[dict]:
         return live[0]
     return {"processing": any(item["processing"] for item in live),
             "tasks": live, "provisional": True}
+
+
+def _runtime_from_session(s: Session, row: SessionRow, now: int,
+                          status: str) -> dict:
+    """Expose a sanitized slot snapshot without treating it as completed work."""
+    model = s.get(Model, row.model_id) if row.model_id else None
+    provider = s.get(Provider, row.provider_id)
+    cfg = s.get(ModelConfig, row.config_id) if row.config_id else None
+    context_max = row.live_context_max or (cfg.context if cfg else None)
+    context_pct = _bounded_pct(row.live_context, context_max)
+    return {
+        "status": status,
+        "processing": status == "LIVE",
+        "source": "slots",
+        "snapshot": "LIVE SLOT" if status in ("LIVE", "FINALIZING") else "LAST SLOT",
+        "model_id": row.model_id,
+        "model": model.name if model else None,
+        "provider": provider.name if provider else None,
+        "slot_id": row.source_slot_id,
+        "task_id": row.source_task_id,
+        "prompt_tokens": round(row.live_prompt_tokens or 0),
+        "gen_tokens": round(row.live_gen_tokens or 0),
+        "gen_tps": round(row.live_gen_tps, 1) if row.live_gen_tps is not None else None,
+        "gen_tps_avg": (round(row.live_gen_tps_avg, 2)
+                        if row.live_gen_tps_avg is not None else None),
+        "gen_tps_3s": (round(row.live_gen_tps_3s, 2)
+                       if row.live_gen_tps_3s is not None else None),
+        "context": row.live_context,
+        "context_max": context_max,
+        "context_pct": context_pct,
+        "observed_at": row.live_seen_at,
+        "age_s": (round(max(0, now - row.live_seen_at) / 1000.0, 1)
+                  if row.live_seen_at else None),
+        "provisional": True,
+    }
+
+
+def _active_models(s: Session, now: int,
+                   model_ids: Optional[list[int]] = None) -> dict[int, dict]:
+    q = select(SessionRow).where(SessionRow.status.in_(["ACTIVE", "FINALIZING"]))
+    if model_ids:
+        q = q.where(SessionRow.model_id.in_(model_ids))
+    rows = list(s.exec(q.order_by(SessionRow.live_seen_at.desc())).all())
+    out: dict[int, dict] = {}
+    for row in rows:
+        if not row.model_id:
+            continue
+        effective = _effective_session_status(row, now)
+        if effective not in ("ACTIVE", "FINALIZING"):
+            continue
+        status = "LIVE" if effective == "ACTIVE" else "FINALIZING"
+        item = out.setdefault(row.model_id, {
+            "model_id": row.model_id,
+            "status": status,
+            "rank": 2 if status == "LIVE" else 1,
+            "task_count": 0,
+            "latest_seen": row.live_seen_at or 0,
+            "realtime": None,
+            "_runtime_rank": 0,
+            "_runtime_seen": 0,
+        })
+        item["task_count"] += 1
+        rank = 2 if status == "LIVE" else 1
+        if rank > item["rank"]:
+            item["rank"] = rank
+            item["status"] = status
+        seen = row.live_seen_at or 0
+        item["latest_seen"] = max(item["latest_seen"], seen)
+        if (rank, seen) >= (item["_runtime_rank"], item["_runtime_seen"]):
+            item["_runtime_rank"] = rank
+            item["_runtime_seen"] = seen
+            item["realtime"] = _runtime_from_session(s, row, now, status)
+    for item in out.values():
+        item.pop("_runtime_rank", None)
+        item.pop("_runtime_seen", None)
+    return out
+
+
+def _provider_runtime_status(provider: Optional[Provider], sample: Optional[TelemetrySample],
+                             now: int) -> str:
+    if provider and provider.status in ("STALE", "OFFLINE"):
+        return provider.status
+    if sample and now - sample.ts <= LIVE_FRESH_MS * 2 and sample.state != "UNLOADED":
+        return "IDLE"
+    return "LAST SEEN"
+
+
+def _selected_realtime(s: Session, models: dict[int, Model], now: int) -> dict:
+    model_ids = list(models)
+    if not model_ids:
+        return {"status": "NO DATA", "processing": False, "source": None,
+                "snapshot": "NO DATA", "observed_at": None, "provisional": False}
+    active = _active_models(s, now, model_ids)
+    if active:
+        chosen = max(active.values(), key=lambda item: (
+            item["rank"], item["task_count"], item["latest_seen"], item["model_id"]))
+        return chosen["realtime"]
+
+    slot_row = s.exec(select(SessionRow).where(
+        SessionRow.model_id.in_(model_ids),
+        SessionRow.live_seen_at.is_not(None),
+    ).order_by(SessionRow.live_seen_at.desc())).first()
+    if slot_row is not None:
+        model = models.get(slot_row.model_id)
+        provider = s.get(Provider, model.provider_id) if model else None
+        sample = s.exec(select(TelemetrySample).where(
+            TelemetrySample.model_id == slot_row.model_id,
+        ).order_by(TelemetrySample.ts.desc())).first()
+        status = _provider_runtime_status(provider, sample, now)
+        return _runtime_from_session(s, slot_row, now, status)
+
+    latest_sample = s.exec(select(TelemetrySample).where(
+        TelemetrySample.model_id.in_(model_ids),
+    ).order_by(TelemetrySample.ts.desc())).first()
+    latest_session = s.exec(select(SessionRow).where(
+        SessionRow.model_id.in_(model_ids),
+    ).order_by(SessionRow.start_at.desc())).first()
+    model_id = (latest_sample.model_id if latest_sample and latest_sample.model_id else
+                (latest_session.model_id if latest_session else None))
+    model = models.get(model_id) if model_id else None
+    provider = s.get(Provider, model.provider_id) if model else None
+    cfg = None
+    if latest_session and latest_session.config_id:
+        cfg = s.get(ModelConfig, latest_session.config_id)
+    context = latest_sample.context_used if latest_sample else None
+    context_max = ((latest_sample.context_max if latest_sample else None) or
+                   (cfg.context if cfg else None))
+    context_pct = _bounded_pct(context, context_max)
+    observed_at = (latest_sample.ts if latest_sample else
+                   ((latest_session.end_at or latest_session.start_at)
+                    if latest_session else None))
+    if model is None:
+        return {"status": "NO DATA", "processing": False, "source": None,
+                "snapshot": "NO DATA", "observed_at": None, "provisional": False}
+    return {
+        "status": _provider_runtime_status(provider, latest_sample, now),
+        "processing": False,
+        "source": "metrics",
+        "snapshot": "LAST METRICS",
+        "model_id": model.id,
+        "model": model.name,
+        "provider": provider.name if provider else None,
+        "slot_id": None,
+        "task_id": None,
+        "prompt_tokens": round(latest_session.prompt_tokens or 0) if latest_session else None,
+        "gen_tokens": round(latest_session.gen_tokens or 0) if latest_session else None,
+        "gen_tps": (round(latest_session.avg_gen_tps, 1)
+                    if latest_session and latest_session.avg_gen_tps is not None else None),
+        "gen_tps_avg": (round(latest_session.avg_gen_tps, 2)
+                        if latest_session and latest_session.avg_gen_tps is not None else None),
+        "gen_tps_3s": None,
+        "context": context,
+        "context_max": context_max,
+        "context_pct": context_pct,
+        "observed_at": observed_at,
+        "age_s": (round(max(0, now - observed_at) / 1000.0, 1)
+                  if observed_at else None),
+        "provisional": False,
+    }
 from .settings import (FAMILY_TAG_TOKENS, MODEL_COLORS, QUANT_TOKENS,
                        RANGE_BUCKETS, TELEMETRY_GROUPS)
 
@@ -395,6 +563,7 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
     accumulate(samples, acc, start, now, now)
     sess = sessions_in_range(s, prov_ids, start)
     sess_by_model = _sessions_by_model(sess)
+    active_by_model = _active_models(s, now, list(m_by_id))
 
     def gkey(m: Model) -> str:
         if group == "family":
@@ -409,7 +578,8 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
     for m in models:
         a = acc.get(m.id)
         tokens = a.tokens if a else 0.0
-        if tokens <= 0 and m.id not in sess_by_model:
+        active = active_by_model.get(m.id)
+        if tokens <= 0 and m.id not in sess_by_model and active is None:
             continue
         g = gkey(m)
         row = groups.setdefault(g, {
@@ -418,6 +588,7 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
             "loaded_time": 0.0, "idle_time": 0.0,
             "peak_gen": 0.0, "peak_prompt": 0.0,
             "sessions": 0, "spark": [0.0] * SPARK_BUCKETS, "color": m.color,
+            "active_rank": 0, "active_tasks": 0, "active_seen_at": 0,
         })
         row["model_ids"].append(m.id)
         row["tokens"] += tokens
@@ -433,6 +604,10 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
             for i in range(SPARK_BUCKETS):
                 row["spark"][i] += a.spark[i]
         row["sessions"] += len(sess_by_model.get(m.id, []))
+        if active:
+            row["active_rank"] = max(row["active_rank"], active["rank"])
+            row["active_tasks"] += active["task_count"]
+            row["active_seen_at"] = max(row["active_seen_at"], active["latest_seen"])
 
     rows = []
     for row in groups.values():
@@ -447,6 +622,12 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
             "inference_s": round(row["prompt_time"] + row["gen_time"]),
             "loaded_s": round(row["loaded_time"]),
             "idle_s": round(row["idle_time"]),
+            "active": row["active_rank"] > 0,
+            "active_status": ("LIVE" if row["active_rank"] == 2 else
+                              ("FINALIZING" if row["active_rank"] == 1 else None)),
+            "active_rank": row["active_rank"],
+            "active_tasks": row["active_tasks"],
+            "active_seen_at": row["active_seen_at"] or None,
             "spark": [round(x) for x in row["spark"]],
         })
     rows.sort(key=lambda r: r["tokens"], reverse=True)
@@ -555,6 +736,7 @@ def selected_stats(s: Session, model_ids: list[int], provider_id: Optional[int],
         "provider": (s.get(Provider, m.provider_id).name if m else None),
         "live": live_items[0] if len(live_items) == 1 else
                 ({"tasks": live_items, "provisional": True} if live_items else None),
+        "realtime": _selected_realtime(s, models, now),
     }
 
 
@@ -614,6 +796,8 @@ def overview(s: Session, provider_id: Optional[int] = None) -> dict:
             current["state"] = "GENERATING" if current["live"].get("gen_tokens", 0) > 0 else "PROMPTING"
             current["gen_tps"] = current["live"].get("gen_tps")
             current["context_used"] = current["live"].get("context")
+            current["context_max"] = current["live"].get("context_max") or current["context_max"]
+            current["context_pct"] = current["live"].get("context_pct")
 
     day_start = local_day_start_ms(now)
     prov_ids = [p.id for p in provs]
@@ -745,6 +929,8 @@ def live_snapshot(s: Session) -> dict:
             current["state"] = "GENERATING" if current["live"].get("gen_tokens", 0) > 0 else "PROMPTING"
             current["gen_tps"] = current["live"].get("gen_tps")
             current["context_used"] = current["live"].get("context")
+            current["context_max"] = current["live"].get("context_max") or current["context_max"]
+            current["context_pct"] = current["live"].get("context_pct")
     day_start = local_day_start_ms(now)
     samples = fetch_samples(s, [p.id for p in provs], day_start)
     acc: dict[int, ModelAcc] = {}
@@ -754,7 +940,9 @@ def live_snapshot(s: Session) -> dict:
         "inference_s": round(sum(a.prompt_time + a.gen_time for a in acc.values())),
         "sessions": len(sessions_in_range(s, [p.id for p in provs], day_start)),
     }
-    return {"providers": provs_out, "current": current, "today": today, "now": now}
+    active_models = list(_active_models(s, now).values())
+    return {"providers": provs_out, "current": current, "today": today,
+            "active_models": active_models, "now": now}
 
 
 # ---------------------------------------------------------------------------

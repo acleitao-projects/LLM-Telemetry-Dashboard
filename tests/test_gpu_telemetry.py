@@ -43,7 +43,7 @@ class BuildMetadataTests(unittest.TestCase):
             version = session.exec(text(
                 "SELECT value FROM meta WHERE key='schema_version'"
             )).first()[0]
-            self.assertEqual(version, "5")
+            self.assertEqual(version, "6")
             self.assertEqual([(row.version, row.commit) for row in builds],
                              [("b10666", "4e97ac86e")])
 

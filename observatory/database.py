@@ -10,7 +10,7 @@ from sqlalchemy.engine import Engine
 
 from . import models  # noqa: F401  (register tables)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _engine: Engine | None = None
 _db_path: str | None = None
@@ -163,6 +163,19 @@ def _migrate(engine: Engine) -> None:
                         ))
                 s.exec(text(
                     "UPDATE meta SET value = '5' WHERE key = 'schema_version'"
+                ))
+                s.commit()
+                version = 5
+            if version < 6:
+                columns = {row[1] for row in s.exec(text(
+                    "PRAGMA table_info(session)"
+                )).all()}
+                if "live_context_max" not in columns:
+                    s.exec(text(
+                        "ALTER TABLE session ADD COLUMN live_context_max INTEGER"
+                    ))
+                s.exec(text(
+                    "UPDATE meta SET value = '6' WHERE key = 'schema_version'"
                 ))
                 s.commit()
             if version > SCHEMA_VERSION:

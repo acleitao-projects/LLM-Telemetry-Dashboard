@@ -53,11 +53,12 @@ class NoSlotsClient(SequenceClient):
         return values
 
 
-def live_slot(decoded: int, task: int = 10, slot: int = 0):
+def live_slot(decoded: int, task: int = 10, slot: int = 0, context_max: int = 4096):
     return [{
         "id": slot, "id_task": task, "is_processing": True,
         "n_prompt_tokens_processed": 20,
         "n_prompt_tokens": 20 + decoded,
+        "n_ctx": context_max,
         "next_token": [{"n_decoded": decoded}],
         "params": {"prompt": "must never be retained"},
     }]
@@ -68,7 +69,7 @@ class SlotSessionTests(unittest.TestCase):
         parsed = _slot_snapshots(live_slot(100))
         self.assertEqual(parsed, [{
             "slot_id": 0, "task_id": 10, "prompt_tokens": 20.0,
-            "gen_tokens": 100.0, "context": 120,
+            "gen_tokens": 100.0, "context": 120, "context_max": 4096,
         }])
         self.assertNotIn("params", parsed[0])
 
@@ -99,6 +100,12 @@ class SlotSessionTests(unittest.TestCase):
             live = metrics._session_live(run, int((now + 4) * 1000))
             self.assertEqual(live["gen_tps_avg"], 8.0)
             self.assertEqual(live["gen_tps_3s"], 8.0)
+            self.assertEqual(live["context_max"], 4096)
+            self.assertEqual(live["context_pct"], 3.7)
+            run.live_context = 5000
+            self.assertEqual(metrics._session_live(run, int((now + 4) * 1000))["context_pct"], 100.0)
+            run.live_context_max = None
+            self.assertIsNone(metrics._session_live(run, int((now + 4) * 1000))["context_pct"])
 
     def test_completion_reconciles_metrics_without_adding_live_tokens(self):
         engine = memory_engine()
@@ -131,7 +138,8 @@ class SlotSessionTests(unittest.TestCase):
             self.assertEqual(run.status, "CLOSED")
             self.assertEqual(run.result_source, "metrics")
             self.assertEqual(run.gen_tokens, 100)
-            self.assertIsNone(run.live_gen_tokens)
+            self.assertEqual(run.live_gen_tokens, 100)
+            self.assertEqual(run.live_context_max, 4096)
             self.assertEqual(run.avg_gen_tps, 10)
 
     def test_parallel_slots_create_distinct_sessions(self):
@@ -223,6 +231,96 @@ class SlotSessionTests(unittest.TestCase):
             self.assertEqual(data["sessions"][0]["status"], "INTERRUPTED")
             session.refresh(run)
             self.assertEqual(run.status, "ACTIVE")
+
+    def test_active_zero_history_model_is_listed_and_selected_runtime_uses_exact_variant(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router",
+                                status="LIVE", last_success_at=now)
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="family-q4", name="family-q4",
+                          family="family")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            run = SessionRow(
+                provider_id=provider.id, model_id=model.id, start_at=now - 1000,
+                status="ACTIVE", source_slot_id=0, source_task_id=77,
+                live_prompt_tokens=20, live_gen_tokens=120, live_context=140,
+                live_context_max=1000, live_gen_tps_avg=8.25,
+                live_gen_tps_3s=8.2, live_seen_at=now,
+            )
+            session.add(run)
+            session.commit()
+
+            page = metrics.models_page(session, None, "today", "family")
+            self.assertEqual(len(page["rows"]), 1)
+            self.assertTrue(page["rows"][0]["active"])
+            self.assertEqual(page["rows"][0]["active_tasks"], 1)
+            selected = metrics.selected_stats(session, [model.id], None, "today")
+            self.assertEqual(selected["realtime"]["status"], "LIVE")
+            self.assertEqual(selected["realtime"]["model"], "family-q4")
+            self.assertEqual(selected["realtime"]["context_pct"], 14.0)
+
+    def test_closed_session_preserves_provisional_snapshot_for_selected_runtime(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router", status="LIVE")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="model", name="model")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            session.add(SessionRow(
+                provider_id=provider.id, model_id=model.id, start_at=now - 5000,
+                end_at=now - 1000, status="CLOSED", live_gen_tokens=90,
+                live_context=110, live_context_max=2048, live_seen_at=now - 1000,
+                source_slot_id=0, source_task_id=88, result_source="metrics",
+            ))
+            session.commit()
+
+            selected = metrics.selected_stats(session, [model.id], None, "today")
+            realtime = selected["realtime"]
+            self.assertEqual(realtime["source"], "slots")
+            self.assertEqual(realtime["snapshot"], "LAST SLOT")
+            self.assertEqual(realtime["gen_tokens"], 90)
+            self.assertTrue(realtime["provisional"])
+
+    def test_selected_runtime_uses_honest_metrics_fallback_and_provider_health(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router", status="LIVE")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="model", name="model")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            session.add(TelemetrySample(
+                provider_id=provider.id, model_id=model.id, ts=now,
+                state="IDLE", context_used=500, context_max=1000,
+            ))
+            session.commit()
+
+            realtime = metrics.selected_stats(session, [model.id], None, "today")["realtime"]
+            self.assertEqual(realtime["status"], "IDLE")
+            self.assertEqual(realtime["snapshot"], "LAST METRICS")
+            self.assertEqual(realtime["context_pct"], 50.0)
+            self.assertFalse(realtime["provisional"])
+
+            provider.status = "STALE"
+            session.add(provider)
+            session.commit()
+            realtime = metrics.selected_stats(session, [model.id], None, "today")["realtime"]
+            self.assertEqual(realtime["status"], "STALE")
 
 
 class CollectorLeaseTests(unittest.TestCase):

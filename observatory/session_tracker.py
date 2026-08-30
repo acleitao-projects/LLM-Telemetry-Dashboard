@@ -48,6 +48,7 @@ class LiveTaskState:
     prompt_tokens: float = 0.0
     gen_tokens: float = 0.0
     context: Optional[int] = None
+    context_max: Optional[int] = None
     speed_points: list[tuple[float, float]] = field(default_factory=list)
     generation_started_at: Optional[float] = None
     generation_start_tokens: float = 0.0

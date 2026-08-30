@@ -200,6 +200,7 @@ class SessionRow(SQLModel, table=True):
     live_prompt_tokens: Optional[float] = None
     live_gen_tokens: Optional[float] = None
     live_context: Optional[int] = None
+    live_context_max: Optional[int] = None
     live_gen_tps: Optional[float] = None
     live_gen_tps_avg: Optional[float] = None
     live_gen_tps_3s: Optional[float] = None

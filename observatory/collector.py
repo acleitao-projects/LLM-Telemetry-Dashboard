@@ -75,6 +75,7 @@ def _slot_snapshots(payload: object) -> list[dict]:
             "prompt_tokens": float(_opt_int(raw.get("n_prompt_tokens_processed")) or 0),
             "gen_tokens": float(_opt_int(nxt0.get("n_decoded")) or 0),
             "context": _opt_int(raw.get("n_prompt_tokens")),
+            "context_max": _opt_int(raw.get("n_ctx")),
         })
     return out
 
@@ -832,6 +833,7 @@ class Collector:
             task.prompt_tokens = float(snap.get("prompt_tokens") or 0)
             task.gen_tokens = gen_tokens
             task.context = snap.get("context")
+            task.context_max = snap.get("context_max") or _opt_int(cfg.get("context"))
             row = s.get(SessionRow, task.session_id)
             if row:
                 row.status = "ACTIVE"
@@ -839,6 +841,7 @@ class Collector:
                 row.live_prompt_tokens = task.prompt_tokens
                 row.live_gen_tokens = task.gen_tokens
                 row.live_context = task.context
+                row.live_context_max = task.context_max
                 row.live_gen_tps = live_tps
                 row.live_gen_tps_avg = live_tps_avg
                 row.live_gen_tps_3s = live_tps_3s
@@ -862,13 +865,6 @@ class Collector:
                     row.result_source = "metrics" if has_metrics else "incomplete"
                     row.end_at = int(task.last_seen * 1000)
                     row.duration_s = max(0.0, (row.end_at - row.start_at) / 1000.0)
-                    if has_metrics:
-                        row.live_prompt_tokens = None
-                        row.live_gen_tokens = None
-                        row.live_context = None
-                        row.live_gen_tps = None
-                        row.live_gen_tps_avg = None
-                        row.live_gen_tps_3s = None
                     s.add(row)
                 st.live_tasks.pop(key, None)
 
@@ -1108,12 +1104,6 @@ class Collector:
             sess.avg_gen_tps = sess.gen_tokens / sess.gen_time_s
         sess.status = "CLOSED"
         sess.result_source = sess.result_source or "metrics"
-        sess.live_prompt_tokens = None
-        sess.live_gen_tokens = None
-        sess.live_context = None
-        sess.live_gen_tps = None
-        sess.live_gen_tps_avg = None
-        sess.live_gen_tps_3s = None
         st.active_session_id = None
         st.stats = None
         st.last_activity_ts = None

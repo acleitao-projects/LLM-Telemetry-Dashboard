@@ -5,8 +5,8 @@ const RANGES = ["today", "2d", "3d", "5d", "7d", "30d", "all"];
 const RANGE_LABELS = { today: "Today", "2d": "2d", "3d": "3d", "5d": "5d", "7d": "7d", "30d": "30d", all: "All" };
 const GROUPS = ["family", "file", "quant"];
 const GROUP_LABELS = { family: "Family", file: "Each file", quant: "Quant" };
-const METRIC_KEYS = ["inference", "loaded", "idle"];
-const METRIC_LABELS = { inference: "Inference", loaded: "Loaded", idle: "Idle" };
+const METRIC_KEYS = ["active", "inference", "loaded", "idle"];
+const METRIC_LABELS = { active: "Active", inference: "Inference", loaded: "Loaded", idle: "Idle" };
 const DETAIL_RANGES = ["1m", "5m", "15m", "1h", "session", "24h", "7d", "30d"];
 
 window.META = null;
@@ -107,16 +107,48 @@ function gpuDualSeries(gpus) {
   return out;
 }
 
-function gpuSummaryCards(gpus, current) {
+function clampPct(value) {
+  if (value == null || !isFinite(Number(value))) return null;
+  return Math.max(0, Math.min(100, Number(value)));
+}
+
+function resourceGauge(label, pct, center, detail, aria) {
+  const value = clampPct(pct);
+  const arc = value == null ? 0 : value * 0.75;
+  return '<div class="resource-gauge" role="img" aria-label="' + esc(aria || label) + '">' +
+    '<div class="gauge-label">' + esc(label) + '</div><svg viewBox="0 0 100 84" aria-hidden="true">' +
+    '<circle class="gauge-track" cx="50" cy="47" r="35" pathLength="100"></circle>' +
+    '<circle class="gauge-fill" cx="50" cy="47" r="35" pathLength="100" style="stroke-dasharray:' +
+    arc.toFixed(2) + ' 100"></circle>' +
+    '<text class="gauge-value" x="50" y="51" text-anchor="middle">' + esc(center) + '</text></svg>' +
+    '<div class="gauge-detail">' + esc(detail || "—") + '</div></div>';
+}
+
+function gpuSummaryCards(gpus, mode) {
   if (!gpus || !gpus.length) return '<div class="empty">no per-GPU data in range</div>';
+  const isLive = mode === "live";
+  const modeLabel = isLive ? "LIVE" : mode === "session" ? "SESSION AVG" : "RANGE AVG";
   return '<div class="gpu-cards">' + gpus.map((gpu) => {
-    const v = current ? (gpu.current || {}) : (gpu.summary || {});
+    const v = isLive ? (gpu.current || {}) : (gpu.summary || {});
+    const total = gpu.vram_total_mb;
+    const vramPct = v.vram_mb != null && total ? v.vram_mb / total * 100 : null;
+    const shownVramPct = clampPct(vramPct);
+    const shownUtilPct = clampPct(v.util);
+    const usedText = v.vram_mb != null ? fmtBytes(v.vram_mb * 1024 * 1024) : "—";
+    const totalText = total ? fmtBytes(total * 1024 * 1024) : "max unavailable";
+    const ident = gpu.label || ("GPU " + (gpu.index != null ? gpu.index : "?"));
     return '<div class="gpu-card" style="border-top-color:' + esc(gpu.color) + '">' +
-      '<div class="gpu-title"><b>' + esc(gpu.label) + '</b><span>' + esc(gpu.pcie || "") + '</span></div>' +
-      '<div class="gpu-stats"><span><i>UTIL</i>' + (v.util != null ? v.util + "%" : "—") + '</span>' +
-      '<span><i>VRAM</i>' + (v.vram_mb != null ? fmtBytes(v.vram_mb * 1024 * 1024) : "—") + '</span>' +
-      '<span><i>TEMP</i>' + (v.temp_c != null ? v.temp_c + "°C" : "—") + '</span>' +
-      '<span><i>POWER</i>' + (v.power_w != null ? v.power_w + " W" : "—") + '</span></div></div>';
+      '<div class="gpu-title"><b><span class="m-dot" style="background:' + esc(gpu.color) + '"></span> ' +
+      esc(ident) + '</b><span>' + modeLabel + '</span></div>' +
+      '<div class="gpu-gauges">' +
+      resourceGauge("VRAM", vramPct, shownVramPct == null ? "—" : Math.round(shownVramPct) + "%",
+        usedText + " / " + totalText, ident + " VRAM " + usedText + " of " + totalText) +
+      resourceGauge("UTILIZATION", v.util, shownUtilPct == null ? "—" : Math.round(shownUtilPct) + "%",
+        (v.temp_c != null ? v.temp_c + "°C" : "—") + " · " +
+        (v.power_w != null ? v.power_w + " W" : "—"), ident + " utilization") + '</div>' +
+      '<div class="gpu-meta"><span><i>PCIe</i>' + esc(gpu.pcie || "—") + '</span>' +
+      '<span><i>TEMPERATURE</i>' + (v.temp_c != null ? esc(v.temp_c + "°C") : "—") + '</span>' +
+      '<span><i>POWER</i>' + (v.power_w != null ? esc(v.power_w + " W") : "—") + '</span></div></div>';
   }).join("") + "</div>";
 }
 
@@ -312,12 +344,15 @@ function initOverview() {
 /* ------------------------------------------------------------------ models page */
 function initModels(meta) {
   const ch = makeCharts();
+  const rowCh = makeCharts();
   let selChart = null;
+  let selectedWasActive = false;
+  let activeSignature = null;
   const disp = (meta && meta.display) || {};
   const st = {
     range: RANGES.includes(disp.default_range) ? disp.default_range : "7d",
     group: GROUPS.includes(disp.default_group) ? disp.default_group : "family",
-    sort: "inference",
+    sort: "active",
     rows: [],
     top: {},
     selectedKey: null,
@@ -327,11 +362,22 @@ function initModels(meta) {
 
   const sorted = () => {
     const rows = st.rows.slice();
-    rows.sort((a, b) => (b[st.sort + "_s"] || 0) - (a[st.sort + "_s"] || 0));
+    rows.sort((a, b) => {
+      if (st.sort === "active") {
+        return (b.active_rank || 0) - (a.active_rank || 0) ||
+          (b.active_tasks || 0) - (a.active_tasks || 0) ||
+          (b.active_seen_at || 0) - (a.active_seen_at || 0) ||
+          (b.inference_s || 0) - (a.inference_s || 0) ||
+          String(a.label).localeCompare(String(b.label));
+      }
+      return (b[st.sort + "_s"] || 0) - (a[st.sort + "_s"] || 0) ||
+        String(a.label).localeCompare(String(b.label));
+    });
     return rows;
   };
 
   const renderTopCards = (top) => {
+    ch.clear();
     st.top = top || {};
     const spark = new Array(24).fill(0);
     st.rows.forEach((r) => (r.spark || []).forEach((v, i) => { spark[i] += v || 0; }));
@@ -346,33 +392,53 @@ function initModels(meta) {
     ch.spark(el("topSpark"), spark, OC.blue);
   };
 
-  const liveTimingHtml = (live) => {
-    if (!live || !live.processing) {
-      return '<div class="live-timing"><div class="live-timing-head"><span>REAL-TIME TIMING</span>' +
-        '<span class="muted">IDLE</span></div><div class="live-timing-note">No active inference for this selection.</div></div>';
+  const runtimeHtml = (live) => {
+    live = live || { status: "NO DATA", snapshot: "NO DATA" };
+    const status = live.status || "NO DATA";
+    const statusHtml = '<span class="runtime-badge status-' + esc(status.toLowerCase().replace(/\s+/g, "-")) +
+      '">● ' + esc(status) + '</span>';
+    if (!live.source) {
+      return '<div class="live-timing"><div class="live-timing-head"><span>RUNTIME TELEMETRY</span>' +
+        statusHtml + '</div><div class="live-timing-note">No reliable runtime observation exists for this selection.</div></div>';
     }
     const item = (label, value) => '<span class="live-timing-item"><i>' + esc(label) + '</i><b>' +
       esc(value == null ? "—" : value) + "</b></span>";
-    return '<div class="live-timing"><div class="live-timing-head"><span>REAL-TIME TIMING</span>' +
-      '<span class="live-badge">● LIVE</span></div><div class="live-timing-grid">' +
+    const age = live.age_s == null ? "—" : live.age_s < 1 ? "just now" : live.age_s + "s ago";
+    const ctx = live.context;
+    const ctxMax = live.context_max;
+    const ctxDetail = ctx != null ? fmtNum(ctx) + " / " + (ctxMax ? fmtNum(ctxMax) + " tokens" : "max unavailable") : "no context data";
+    const ctxCenter = live.context_pct != null ? Math.round(live.context_pct) + "%" : (ctx != null ? fmtTokens(ctx) : "—");
+    const note = live.source === "slots" ?
+      "Slot-observed and provisional; completed totals still come from /metrics." :
+      live.source === "metrics" ? "Latest completed /metrics observation; not a live slot." :
+        "No reliable runtime observation exists for this selection.";
+    return '<div class="live-timing"><div class="live-timing-head"><span>RUNTIME TELEMETRY</span>' +
+      statusHtml + '</div>' + (live.model ? '<div class="runtime-variant">' + esc(live.model) +
+        (live.snapshot ? ' · ' + esc(live.snapshot) : "") + '</div>' : "") +
+      '<div class="runtime-layout"><div class="live-timing-grid">' +
       item("slot", live.slot_id) + item("task", live.task_id) +
-      item("n_gen", fmtNum(live.gen_tokens || 0)) +
-      item("tg avg", live.gen_tps_avg != null ? live.gen_tps_avg.toFixed(2) + " t/s" : "warming up") +
-      item("tg 3s", live.gen_tps_3s != null ? live.gen_tps_3s.toFixed(2) + " t/s" : "warming up") +
-      item("context", live.context != null ? fmtNum(live.context) : "—") +
-      '</div><div class="live-timing-note">Slot-observed and provisional; completed totals still come from /metrics.</div></div>';
+      item("n_gen", live.gen_tokens == null ? "—" : fmtNum(live.gen_tokens)) +
+      item("tg avg", live.gen_tps_avg != null ? live.gen_tps_avg.toFixed(2) + " t/s" :
+        live.processing ? "warming up" : "—") +
+      item("tg 3s", live.gen_tps_3s != null ? live.gen_tps_3s.toFixed(2) + " t/s" :
+        live.processing ? "warming up" : "—") +
+      item("observed", age) + '</div><div class="runtime-context">' +
+      resourceGauge("CONTEXT", live.context_pct, ctxCenter, ctxDetail, "Context " + ctxDetail) +
+      '</div></div><div class="live-timing-note">' + esc(note) + '</div></div>';
   };
 
-  const updateLiveTiming = (live) => {
-    const target = el("selLiveTiming");
-    if (target) target.innerHTML = liveTimingHtml(live);
+  const updateRuntime = (live) => {
+    const target = el("selRuntime");
+    if (target) target.innerHTML = runtimeHtml(live);
   };
 
   const renderSelected = (row) => {
     const box = el("selPanel");
     if (!row) { box.innerHTML = '<div class="empty">select a model</div>'; return; }
+    const requestedKey = row.key;
     box.innerHTML = '<div class="empty"><span class="spin"></span> loading…</div>';
     api("/api/models/selected?ids=" + row.model_ids.join(",") + "&range=" + st.range).then((s) => {
+      if (requestedKey !== st.selectedKey) return;
       if (!s || !s.label) { box.innerHTML = '<div class="empty">no data for selection</div>'; return; }
       const pt = s.prompt_tokens || 0, gt = s.gen_tokens || 0, tot = (pt + gt) || 1;
       const hasMtp = s.mtp_proposed != null && s.mtp_proposed > 0;
@@ -381,6 +447,7 @@ function initModels(meta) {
         '<div class="sel-head"><span class="m-dot" style="background:' + esc(s.color) + '"></span>' +
         '<span class="tag">SELECTED</span><span class="sel-name">' + esc(s.label) + "</span></div>" +
         '<div class="mc-sub" style="margin-top:2px">' + esc(s.provider || "") + " · range " + st.range + "</div>" +
+        '<div id="selRuntime">' + runtimeHtml(s.realtime) + "</div>" +
         '<div class="sel-grid">' +
         selMetric("TOKENS", fmtTokens(s.tokens), s.share != null ? s.share + "% of all models" : "") +
         selMetric("GENERATED", s.generated_pct != null ? s.generated_pct + "%" : "—", fmtTokens(gt) + " generated") +
@@ -402,16 +469,18 @@ function initModels(meta) {
         '<i style="width:' + (gt / tot * 100) + "%;background:" + OC.green + '"></i></div>' +
         '<div class="legend"><span><i style="background:' + OC.amber + '"></i>prompt ' + fmtTokens(pt) +
         '</span><span><i style="background:' + OC.green + '"></i>generated ' + fmtTokens(gt) + "</span></div>" +
-        '<div id="selSpark" style="width:100%;height:34px;margin-top:10px"></div>' +
-        '<div id="selLiveTiming">' + liveTimingHtml(live) + "</div>";
+        '<div id="selSpark" style="width:100%;height:34px;margin-top:10px"></div>';
+      selectedWasActive = !!(s.realtime && ["LIVE", "FINALIZING"].includes(s.realtime.status));
       if (selChart) { try { selChart.dispose(); } catch (e) {} selChart = null; }
       selChart = sparkline(el("selSpark"), s.spark || [0], s.color);
     });
   };
 
   const renderTable = () => {
-    ch.clear();
+    rowCh.clear();
     const rows = sorted();
+    const metricHead = el("sortMetricHead");
+    if (metricHead) metricHead.textContent = METRIC_LABELS[st.sort];
     const unit = st.group === "file" ? "files" : st.group === "quant" ? "quants" : "families";
     el("mModelsCount").textContent = rows.length ? rows.length + " " + unit + " · " + st.range : "";
     const tb = el("modelTableBody");
@@ -419,18 +488,32 @@ function initModels(meta) {
       tb.innerHTML = '<tr><td colspan="8"><div class="empty">no model activity in this range</div></td></tr>';
       return;
     }
+    const maxMetric = st.sort === "active" ? 0 : Math.max(1, ...rows.map((r) => r[st.sort + "_s"] || 0));
+    const sortCell = (r) => {
+      if (st.sort === "active") {
+        if (!r.active_rank) return '<span class="muted">—</span>';
+        return '<span class="row-live status-' + (r.active_status || "LIVE").toLowerCase() + '">● ' +
+          esc(r.active_status || "LIVE") + '</span><span class="task-count">' +
+          (r.active_tasks || 0) + ' task' + ((r.active_tasks || 0) === 1 ? "" : "s") + '</span>';
+      }
+      const seconds = r[st.sort + "_s"] || 0;
+      return '<div class="sort-duration">' + esc(fmtDur(seconds)) + '</div><div class="share-bar"><i style="width:' +
+        Math.min(100, seconds / maxMetric * 100) + '%"></i></div>';
+    };
     tb.innerHTML = rows.map((r, i) =>
       '<tr class="clickable' + (r.key === st.selectedKey ? " selected" : "") + '" data-key="' + esc(r.key) + '">' +
       '<td class="m-rank">' + (i + 1) + "</td>" +
-      '<td class="m-name"><span class="m-dot" style="background:' + esc(r.color) + '"></span> ' + esc(r.label) + "</td>" +
-      '<td class="share-cell"><div class="share-bar"><i style="width:' + Math.min(100, r.share || 0) + "%;background:" + esc(r.color) + '"></i></div></td>' +
+      '<td class="m-name"><span class="m-dot" style="background:' + esc(r.color) + '"></span> ' + esc(r.label) +
+      (r.active_rank ? ' <span class="row-live status-' + (r.active_status || "LIVE").toLowerCase() + '">● ' +
+        esc(r.active_status || "LIVE") + '</span>' : "") + "</td>" +
+      '<td class="share-cell">' + sortCell(r) + '</td>' +
       '<td><div class="row-spark" id="rsp' + i + '"></div></td>' +
       '<td class="num"><b>' + fmtTokens(r.tokens) + "</b></td>" +
       '<td class="num">' + (r.share != null ? r.share + "%" : "—") + "</td>" +
       '<td class="num">' + r.sessions + "</td>" +
       '<td class="num">' + (r.gen_tps != null ? r.gen_tps : "—") + "</td>" +
       "</tr>").join("");
-    rows.forEach((r, i) => { ch.spark(el("rsp" + i), r.spark || [0], r.color); });
+    rows.forEach((r, i) => { rowCh.spark(el("rsp" + i), r.spark || [0], r.color); });
     tb.querySelectorAll("tr.clickable").forEach((tr) => {
       tr.onclick = () => {
         st.selectedKey = tr.dataset.key;
@@ -444,12 +527,12 @@ function initModels(meta) {
 
   const render = (d) => {
     st.rows = d.rows || [];
-    renderTopCards(d.top || {});
-    renderTable();
     if (st.selectedKey == null) st.selectedKey = st.rows.length ? sorted()[0].key : null;
     if (st.selectedKey && !st.rows.find((r) => r.key === st.selectedKey)) {
       st.selectedKey = st.rows.length ? sorted()[0].key : null;
     }
+    renderTopCards(d.top || {});
+    renderTable();
     const row = st.rows.find((r) => r.key === st.selectedKey);
     renderSelected(row || null);
   };
@@ -471,16 +554,52 @@ function initModels(meta) {
     load().then(render);
   });
   segControl("sortSeg", METRIC_KEYS.map((k) => METRIC_LABELS[k]), METRIC_LABELS[st.sort], (lbl) => {
-    st.sort = METRIC_KEYS.find((k) => METRIC_LABELS[k] === lbl) || "inference";
+    st.sort = METRIC_KEYS.find((k) => METRIC_LABELS[k] === lbl) || "active";
     renderTable();
   });
 
   window.__onLive = (d) => {
-    const current = d && d.current;
+    const activeModels = (d && d.active_models) || [];
+    const unrepresented = activeModels.some((a) => !st.rows.some((r) => (r.model_ids || []).includes(a.model_id)));
+    if (unrepresented) {
+      load().then((fresh) => {
+        st.rows = fresh.rows || [];
+        renderTopCards(fresh.top || {});
+        renderTable();
+      }).catch(() => {});
+    }
+    const signature = activeModels.map((x) => [x.model_id, x.rank, x.task_count].join(":"))
+      .sort().join("|");
+    if (signature !== activeSignature) {
+      activeSignature = signature;
+      st.rows.forEach((r) => {
+        r.active = false; r.active_rank = 0; r.active_tasks = 0;
+        r.active_seen_at = null; r.active_status = null;
+      });
+      activeModels.forEach((a) => {
+        st.rows.filter((r) => (r.model_ids || []).includes(a.model_id)).forEach((r) => {
+          r.active = true;
+          r.active_rank = Math.max(r.active_rank || 0, a.rank || 0);
+          r.active_tasks = (r.active_tasks || 0) + (a.task_count || 0);
+          r.active_seen_at = Math.max(r.active_seen_at || 0, a.latest_seen || 0);
+          r.active_status = r.active_rank === 2 ? "LIVE" : "FINALIZING";
+        });
+      });
+      renderTable();
+    }
     const row = st.rows.find((r) => r.key === st.selectedKey);
-    const selectedIsCurrent = current && row && row.model_ids &&
-      row.model_ids.includes(current.model_id);
-    updateLiveTiming(selectedIsCurrent ? current.live : null);
+    const selectedActive = row ? activeModels.filter((a) => (row.model_ids || []).includes(a.model_id)) : [];
+    selectedActive.sort((a, b) => (b.rank || 0) - (a.rank || 0) ||
+      (b.task_count || 0) - (a.task_count || 0) || (b.latest_seen || 0) - (a.latest_seen || 0));
+    if (selectedActive.length) {
+      updateRuntime(selectedActive[0].realtime);
+      selectedWasActive = true;
+    } else if (selectedWasActive && row) {
+      selectedWasActive = false;
+      api("/api/models/selected?ids=" + row.model_ids.join(",") + "&range=" + st.range)
+        .then((s) => { if (row.key === st.selectedKey) updateRuntime(s.realtime); })
+        .catch(() => {});
+    }
   };
 
   load().then(render);
@@ -554,7 +673,7 @@ function initModelDetail(meta) {
       { name: "gpu 0 util %", color: OC.green, data: g.series.gpu_util, y: 0 },
       { name: "gpu 0 VRAM MB", color: OC.blue, data: g.series.vram_mb, y: 1 },
     ]));
-    el("mdlGpuCards").innerHTML = gpuSummaryCards(g.gpus || [], false);
+    el("mdlGpuCards").innerHTML = gpuSummaryCards(g.gpus || [], "range");
 
     cfgPanelHtml(d.config, "mdlCfg", "mdlFlags", el("mdlCfgSub"));
 
@@ -720,7 +839,7 @@ function initSessionDetail(meta) {
       { name: "gpu 0 util %", color: OC.green, data: g.series.gpu_util, y: 0 },
       { name: "gpu 0 VRAM MB", color: OC.blue, data: g.series.vram_mb, y: 1 },
     ]));
-    el("sdGpuCards").innerHTML = gpuSummaryCards(s.gpus || [], false);
+    el("sdGpuCards").innerHTML = gpuSummaryCards(s.gpus || [], "session");
 
     cfgPanelHtml(d.config, "sdCfg", "sdFlags", el("sdCfgSub"));
   });
@@ -865,6 +984,8 @@ function initHardware(meta) {
       const inventory = ((p.hardware && p.hardware.gpus) || []).map((gpu, fallback) => ({
         label: "GPU " + (gpu.index != null ? gpu.index : fallback) + " · " + (gpu.name || "unknown"),
         color: gpu.color || OC.blue, pcie: gpu.pcie,
+        index: gpu.index != null ? gpu.index : fallback,
+        vram_total_mb: gpu.vram_mb,
         current: { util: gpu.util, vram_mb: gpu.vram_used_mb,
           temp_c: gpu.temp_c, power_w: gpu.power_w },
       }));
@@ -888,7 +1009,7 @@ function initHardware(meta) {
         ((p.hardware || p.build)
           ? '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">' +
             '<div><div class="panel-head"><b>Host</b><span class="muted">' + esc((p.hardware && p.hardware.source) || "") + "</span></div>" +
-            hwKv(p.hardware) + gpuSummaryCards(inventory, true) + "</div>" +
+            hwKv(p.hardware) + gpuSummaryCards(inventory, "live") + "</div>" +
             '<div><div class="panel-head"><b>llama.cpp build</b></div>' + buildKv(p.build) + "</div>" +
             "</div>"
           : '<div class="empty">no hardware or build data observed yet</div>') +
