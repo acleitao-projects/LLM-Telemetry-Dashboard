@@ -6,7 +6,7 @@ import time
 import hashlib
 import json
 from datetime import datetime
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from sqlmodel import Session, select
 
@@ -87,6 +87,8 @@ def _runtime_from_session(s: Session, row: SessionRow, now: int,
         "processing": status == "LIVE",
         "source": "slots",
         "snapshot": "LIVE SLOT" if status in ("LIVE", "FINALIZING") else "LAST SLOT",
+        "session_id": row.id,
+        "session_started_at": row.start_at,
         "model_id": row.model_id,
         "model": model.name if model else None,
         "provider": provider.name if provider else None,
@@ -193,6 +195,11 @@ def _selected_realtime(s: Session, models: dict[int, Model], now: int) -> dict:
                 (latest_session.model_id if latest_session else None))
     model = models.get(model_id) if model_id else None
     provider = s.get(Provider, model.provider_id) if model else None
+    history_session = latest_session if latest_session and latest_session.model_id == model_id else None
+    if history_session is None and model_id:
+        history_session = s.exec(select(SessionRow).where(
+            SessionRow.model_id == model_id,
+        ).order_by(SessionRow.start_at.desc())).first()
     cfg = None
     if latest_session and latest_session.config_id:
         cfg = s.get(ModelConfig, latest_session.config_id)
@@ -211,6 +218,8 @@ def _selected_realtime(s: Session, models: dict[int, Model], now: int) -> dict:
         "processing": False,
         "source": "metrics",
         "snapshot": "LAST METRICS",
+        "session_id": history_session.id if history_session else None,
+        "session_started_at": history_session.start_at if history_session else None,
         "model_id": model.id,
         "model": model.name,
         "provider": provider.name if provider else None,
@@ -231,6 +240,76 @@ def _selected_realtime(s: Session, models: dict[int, Model], now: int) -> dict:
                   if observed_at else None),
         "provisional": False,
     }
+
+
+def _runtime_history(s: Session, realtime: dict,
+                     max_points: int = 120) -> Optional[dict]:
+    """Return a bounded, gap-preserving history for one observed session."""
+    session_id = realtime.get("session_id")
+    if not session_id or max_points < 2:
+        return None
+    rows = list(s.exec(select(
+        TelemetrySample.ts,
+        TelemetrySample.gen_tps,
+        TelemetrySample.context_used,
+    ).where(
+        TelemetrySample.session_id == session_id,
+    ).order_by(TelemetrySample.ts)).all())
+    points = [(row.ts, row.gen_tps, row.context_used) for row in rows]
+    observed_at = realtime.get("observed_at")
+    if observed_at:
+        live_point = (observed_at, realtime.get("gen_tps"), realtime.get("context"))
+        if points and points[-1][0] == observed_at:
+            previous = points[-1]
+            points[-1] = (
+                observed_at,
+                live_point[1] if live_point[1] is not None else previous[1],
+                live_point[2] if live_point[2] is not None else previous[2],
+            )
+        elif not points or observed_at > points[-1][0]:
+            points.append(live_point)
+    if not points:
+        return None
+    if len(points) <= max_points:
+        return {
+            "timestamps": [point[0] for point in points],
+            "gen_tps": [point[1] for point in points],
+            "context": [point[2] for point in points],
+        }
+
+    latest = points[-1]
+    historical = points[:-1]
+    history_limit = max_points - 1
+    start = realtime.get("session_started_at") or historical[0][0]
+    end = historical[-1][0]
+    span = max(1, end - start + 1)
+    bucket_ms = max(1, (span + history_limit - 1) // history_limit)
+    buckets = [{"ts": None, "gen": 0.0, "gen_n": 0,
+                "context": 0.0, "context_n": 0}
+               for _ in range(history_limit)]
+    for ts, gen_tps, context in historical:
+        index = min(history_limit - 1, max(0, (ts - start) // bucket_ms))
+        bucket = buckets[index]
+        bucket["ts"] = ts
+        if gen_tps is not None:
+            bucket["gen"] += gen_tps
+            bucket["gen_n"] += 1
+        if context is not None:
+            bucket["context"] += context
+            bucket["context_n"] += 1
+    last_index = max(index for index, bucket in enumerate(buckets) if bucket["ts"] is not None)
+    buckets = buckets[:last_index + 1]
+    timestamps = [bucket["ts"] if bucket["ts"] is not None
+                  else start + index * bucket_ms
+                  for index, bucket in enumerate(buckets)]
+    gen_tps = [round(bucket["gen"] / bucket["gen_n"], 1)
+               if bucket["gen_n"] else None for bucket in buckets]
+    context = [round(bucket["context"] / bucket["context_n"], 1)
+               if bucket["context_n"] else None for bucket in buckets]
+    timestamps.append(latest[0])
+    gen_tps.append(latest[1])
+    context.append(latest[2])
+    return {"timestamps": timestamps, "gen_tps": gen_tps, "context": context}
 from .settings import (FAMILY_TAG_TOKENS, MODEL_COLORS, QUANT_TOKENS,
                        RANGE_BUCKETS, TELEMETRY_GROUPS)
 
@@ -409,6 +488,46 @@ def fetch_samples(s: Session, prov_ids: list[int], start_ms: int,
     return list(s.exec(q.order_by(TelemetrySample.ts)).all())
 
 
+class OverviewSample(NamedTuple):
+    model_id: Optional[int]
+    ts: int
+    state: str
+    tokens_total: Optional[float]
+    prompt_total: Optional[float]
+    gen_total: Optional[float]
+    prompt_seconds_total: Optional[float]
+    gen_seconds_total: Optional[float]
+    prompt_tps: Optional[float]
+    gen_tps: Optional[float]
+    mtp_proposed_total: Optional[float]
+    mtp_accepted_total: Optional[float]
+    context_used: Optional[int]
+
+
+def fetch_overview_samples(s: Session, prov_ids: list[int],
+                           start_ms: int) -> list[OverviewSample]:
+    """Load the seven-day overview window without materializing full ORM objects."""
+    q = select(
+        TelemetrySample.model_id,
+        TelemetrySample.ts,
+        TelemetrySample.state,
+        TelemetrySample.tokens_total,
+        TelemetrySample.prompt_total,
+        TelemetrySample.gen_total,
+        TelemetrySample.prompt_seconds_total,
+        TelemetrySample.gen_seconds_total,
+        TelemetrySample.prompt_tps,
+        TelemetrySample.gen_tps,
+        TelemetrySample.mtp_proposed_total,
+        TelemetrySample.mtp_accepted_total,
+        TelemetrySample.context_used,
+    ).where(
+        TelemetrySample.provider_id.in_(prov_ids),
+        TelemetrySample.ts >= start_ms,
+    ).order_by(TelemetrySample.ts)
+    return [OverviewSample(*row) for row in s.exec(q).all()]
+
+
 def _delta(r, prev, attr) -> float:
     if r is None or prev is None:
         return 0.0
@@ -417,6 +536,14 @@ def _delta(r, prev, attr) -> float:
         return 0.0
     d = b - a
     return d if d > 0 else 0.0
+
+
+def _value_delta(current, previous) -> float:
+    """Positive counter delta for values already read from a sample."""
+    if current is None or previous is None:
+        return 0.0
+    delta = current - previous
+    return delta if delta > 0 else 0.0
 
 
 def _phase_delta(r: TelemetrySample, prev: TelemetrySample,
@@ -468,22 +595,35 @@ def accumulate(samples: list[TelemetrySample], acc: dict[int, ModelAcc],
         prev = prev_by_model.get(mid)
         if prev is not None:
             dt_s = min(DT_CAP_S, max(0.0, (r.ts - prev.ts) / 1000.0))
-            a.tokens += _delta(r, prev, "tokens_total")
-            a.prompt_tokens += _delta(r, prev, "prompt_total")
-            a.gen_tokens += _delta(r, prev, "gen_total")
-            a.prompt_time += _phase_delta(
-                r, prev, "prompt_total", "prompt_seconds_total", "prompt_tps")
-            a.gen_time += _phase_delta(
-                r, prev, "gen_total", "gen_seconds_total", "gen_tps")
-            a.d_proposed += _delta(r, prev, "mtp_proposed_total")
-            a.d_accepted += _delta(r, prev, "mtp_accepted_total")
+            token_delta = _value_delta(r.tokens_total, prev.tokens_total)
+            prompt_delta = _value_delta(r.prompt_total, prev.prompt_total)
+            gen_delta = _value_delta(r.gen_total, prev.gen_total)
+            a.tokens += token_delta
+            a.prompt_tokens += prompt_delta
+            a.gen_tokens += gen_delta
+            if prompt_delta > 0:
+                prompt_seconds = _value_delta(
+                    r.prompt_seconds_total, prev.prompt_seconds_total)
+                if prompt_seconds > 0:
+                    a.prompt_time += prompt_seconds
+                elif r.prompt_tps is not None and r.prompt_tps > 0:
+                    a.prompt_time += prompt_delta / r.prompt_tps
+            if gen_delta > 0:
+                gen_seconds = _value_delta(
+                    r.gen_seconds_total, prev.gen_seconds_total)
+                if gen_seconds > 0:
+                    a.gen_time += gen_seconds
+                elif r.gen_tps is not None and r.gen_tps > 0:
+                    a.gen_time += gen_delta / r.gen_tps
+            a.d_proposed += _value_delta(
+                r.mtp_proposed_total, prev.mtp_proposed_total)
+            a.d_accepted += _value_delta(
+                r.mtp_accepted_total, prev.mtp_accepted_total)
             st = prev.state
             if st in ("IDLE", "PROMPTING", "GENERATING"):
                 a.loaded_time += dt_s
             b = min(SPARK_BUCKETS - 1, int((prev.ts - start_ms) * SPARK_BUCKETS / span))
-            d_tok = _delta(r, prev, "tokens_total")
-            if d_tok == 0.0:
-                d_tok = _delta(r, prev, "prompt_total") + _delta(r, prev, "gen_total")
+            d_tok = token_delta if token_delta > 0 else prompt_delta + gen_delta
             a.spark[max(0, b)] += d_tok
         if r.gen_tps is not None:
             a.peak_gen = max(a.peak_gen, r.gen_tps)
@@ -492,11 +632,11 @@ def accumulate(samples: list[TelemetrySample], acc: dict[int, ModelAcc],
         if r.context_used:
             a.context_max = max(a.context_max, r.context_used)
         prev_by_model[mid] = r
-    # if a model is loaded now, count the tail up to `now`
+    # If a model is loaded now, count the tail up to `now`. The first pass
+    # already retained each model's last row, so this remains O(samples).
     for mid, a in acc.items():
-        rows = [r for r in samples if r.model_id == mid]
-        if rows:
-            last = rows[-1]
+        last = prev_by_model.get(mid)
+        if last is not None:
             if last.state in ("IDLE", "PROMPTING", "GENERATING") and now - last.ts < 60_000:
                 a.loaded_time += min(60.0, (now - last.ts) / 1000.0)
         a.idle_time = max(0.0, a.loaded_time - a.prompt_time - a.gen_time)
@@ -715,6 +855,10 @@ def selected_stats(s: Session, model_ids: list[int], provider_id: Optional[int],
     m = models.get(model_ids[0])
     live_items = [_model_live(s, model_id, now) for model_id in model_ids]
     live_items = [item for item in live_items if item]
+    realtime = _selected_realtime(s, models, now)
+    history = _runtime_history(s, realtime)
+    if history:
+        realtime["history"] = history
     return {
         "label": m.name if m else None,
         "color": m.color if m else "#4b8de8",
@@ -736,7 +880,7 @@ def selected_stats(s: Session, model_ids: list[int], provider_id: Optional[int],
         "provider": (s.get(Provider, m.provider_id).name if m else None),
         "live": live_items[0] if len(live_items) == 1 else
                 ({"tasks": live_items, "provisional": True} if live_items else None),
-        "realtime": _selected_realtime(s, models, now),
+        "realtime": realtime,
     }
 
 
@@ -800,8 +944,11 @@ def overview(s: Session, provider_id: Optional[int] = None) -> dict:
             current["context_pct"] = current["live"].get("context_pct")
 
     day_start = local_day_start_ms(now)
+    h0 = now - 24 * 3600_000
+    w7 = now - 7 * 86400_000
     prov_ids = [p.id for p in provs]
-    samples = fetch_samples(s, prov_ids, day_start)
+    history_samples = fetch_overview_samples(s, prov_ids, w7)
+    samples = [r for r in history_samples if r.ts >= day_start]
     acc: dict[int, ModelAcc] = {}
     accumulate(samples, acc, day_start, now, now)
     today = {
@@ -815,8 +962,7 @@ def overview(s: Session, provider_id: Optional[int] = None) -> dict:
                             if today["loaded_s"] > 0 else None)
 
     # model usage over last 24h (hourly buckets)
-    h0 = now - 24 * 3600_000
-    samples24 = fetch_samples(s, prov_ids, h0)
+    samples24 = [r for r in history_samples if r.ts >= h0]
     per_model: dict[int, list[int]] = {}
     for r in samples24:
         if r.model_id is None:
@@ -848,8 +994,7 @@ def overview(s: Session, provider_id: Optional[int] = None) -> dict:
                    for i in range(24)]
 
     # inference time by model (7d) + tokens by model (7d)
-    w7 = now - 7 * 86400_000
-    s7 = fetch_samples(s, prov_ids, w7)
+    s7 = history_samples
     acc7: dict[int, ModelAcc] = {}
     accumulate(s7, acc7, w7, now, now)
     inference_by_model = []

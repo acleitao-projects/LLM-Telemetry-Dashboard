@@ -75,6 +75,65 @@ function selMetric(l, v, s) {
     '</div><div class="s">' + esc(s || "") + "</div></div>";
 }
 
+async function capturePanel(target) {
+  if (!target) throw new Error("Capture target is unavailable");
+  if (typeof domtoimage === "undefined") throw new Error("Screenshot renderer is unavailable");
+  const width = Math.ceil(Math.max(target.scrollWidth, target.getBoundingClientRect().width));
+  const height = Math.ceil(Math.max(target.scrollHeight, target.getBoundingClientRect().height));
+  const rendering = domtoimage.toPng(target, {
+    bgcolor: getComputedStyle(target).backgroundColor || "#1b1b19",
+    width: width,
+    height: height,
+    cacheBust: true,
+    copyDefaultStyles: true,
+    filter: (node) => !(node.hasAttribute && node.hasAttribute("data-capture-ignore")),
+    onclone: (clonedTarget) => {
+      clonedTarget.style.width = width + "px";
+      clonedTarget.style.height = height + "px";
+      clonedTarget.style.maxWidth = "none";
+      clonedTarget.style.overflow = "visible";
+    },
+  });
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("Screenshot rendering exceeded 8 seconds")), 8000);
+  });
+  try {
+    return await Promise.race([rendering, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+document.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-capture-target]");
+  if (!button) return;
+  event.stopPropagation();
+  const tabName = "telemetry-capture-" + Date.now();
+  button.href = "about:blank";
+  button.target = tabName;
+  const captureTab = window.open("about:blank", tabName);
+  if (captureTab) {
+    event.preventDefault();
+    captureTab.document.title = "Rendering screenshot…";
+    captureTab.document.body.style.cssText = "margin:0;padding:24px;background:#1b1b19;color:#f1efe9;font:13px system-ui";
+    captureTab.document.body.textContent = "Rendering screenshot…";
+  }
+  button.classList.add("is-capturing");
+  try {
+    const pngUrl = await capturePanel(document.getElementById(button.dataset.captureTarget));
+    const destination = captureTab || window.open("", tabName);
+    if (!destination) throw new Error("The browser blocked the screenshot tab");
+    destination.location.replace(pngUrl);
+  } catch (error) {
+    console.error("Screenshot capture failed", error);
+    const destination = captureTab || window.open("", tabName);
+    if (destination) destination.document.body.textContent = "Screenshot failed: " + error.message;
+  } finally {
+    button.classList.remove("is-capturing");
+  }
+});
+
 function dualAxisOption(labels, series) {
   const o = baseOption();
   o.xAxis.data = labels;
@@ -346,6 +405,8 @@ function initModels(meta) {
   const ch = makeCharts();
   const rowCh = makeCharts();
   let selChart = null;
+  let runtimeChart = null;
+  let runtimeSeries = { sessionId: null, timestamps: [], genTps: [], context: [] };
   let selectedWasActive = false;
   let activeSignature = null;
   const disp = (meta && meta.display) || {};
@@ -392,6 +453,77 @@ function initModels(meta) {
     ch.spark(el("topSpark"), spark, OC.blue);
   };
 
+  const disposeRuntimeChart = () => {
+    if (runtimeChart) { try { runtimeChart.dispose(); } catch (e) {} runtimeChart = null; }
+  };
+
+  const compactRuntimeSeries = () => {
+    if (runtimeSeries.timestamps.length <= 240) return;
+    const latest = {
+      ts: runtimeSeries.timestamps.pop(),
+      gen: runtimeSeries.genTps.pop(),
+      context: runtimeSeries.context.pop(),
+    };
+    const limit = 119;
+    const start = runtimeSeries.timestamps[0];
+    const end = runtimeSeries.timestamps[runtimeSeries.timestamps.length - 1];
+    const bucketMs = Math.max(1, Math.ceil((end - start + 1) / limit));
+    const buckets = Array.from({ length: limit }, () => ({
+      ts: null, gen: 0, genN: 0, context: 0, contextN: 0,
+    }));
+    runtimeSeries.timestamps.forEach((ts, index) => {
+      const bucket = buckets[Math.min(limit - 1, Math.max(0, Math.floor((ts - start) / bucketMs)))];
+      bucket.ts = ts;
+      const gen = runtimeSeries.genTps[index], context = runtimeSeries.context[index];
+      if (gen != null) { bucket.gen += Number(gen); bucket.genN += 1; }
+      if (context != null) { bucket.context += Number(context); bucket.contextN += 1; }
+    });
+    let last = buckets.length - 1;
+    while (last > 0 && buckets[last].ts == null) last -= 1;
+    const kept = buckets.slice(0, last + 1);
+    runtimeSeries.timestamps = kept.map((bucket, index) => bucket.ts == null ? start + index * bucketMs : bucket.ts);
+    runtimeSeries.genTps = kept.map((bucket) => bucket.genN ? Number((bucket.gen / bucket.genN).toFixed(1)) : null);
+    runtimeSeries.context = kept.map((bucket) => bucket.contextN ? Number((bucket.context / bucket.contextN).toFixed(1)) : null);
+    runtimeSeries.timestamps.push(latest.ts);
+    runtimeSeries.genTps.push(latest.gen);
+    runtimeSeries.context.push(latest.context);
+  };
+
+  const syncRuntimeSeries = (live, seed) => {
+    const sessionId = live && live.session_id != null ? String(live.session_id) : null;
+    if (!sessionId) {
+      runtimeSeries = { sessionId: null, timestamps: [], genTps: [], context: [] };
+      return;
+    }
+    if (runtimeSeries.sessionId !== sessionId) {
+      runtimeSeries = { sessionId: sessionId, timestamps: [], genTps: [], context: [] };
+    }
+    const history = live.history;
+    if (history && (seed || !runtimeSeries.timestamps.length)) {
+      const length = Math.min(
+        (history.timestamps || []).length,
+        (history.gen_tps || []).length,
+        (history.context || []).length,
+      );
+      runtimeSeries.timestamps = (history.timestamps || []).slice(0, length).map(Number);
+      runtimeSeries.genTps = (history.gen_tps || []).slice(0, length);
+      runtimeSeries.context = (history.context || []).slice(0, length);
+    }
+    const observedAt = Number(live.observed_at);
+    if (isFinite(observedAt) && observedAt > 0) {
+      const last = runtimeSeries.timestamps.length - 1;
+      if (last >= 0 && runtimeSeries.timestamps[last] === observedAt) {
+        if (live.gen_tps != null) runtimeSeries.genTps[last] = live.gen_tps;
+        if (live.context != null) runtimeSeries.context[last] = live.context;
+      } else if (last < 0 || observedAt > runtimeSeries.timestamps[last]) {
+        runtimeSeries.timestamps.push(observedAt);
+        runtimeSeries.genTps.push(live.gen_tps == null ? null : live.gen_tps);
+        runtimeSeries.context.push(live.context == null ? null : live.context);
+      }
+    }
+    compactRuntimeSeries();
+  };
+
   const runtimeHtml = (live) => {
     live = live || { status: "NO DATA", snapshot: "NO DATA" };
     const status = live.status || "NO DATA";
@@ -408,29 +540,70 @@ function initModels(meta) {
     const ctxMax = live.context_max;
     const ctxDetail = ctx != null ? fmtNum(ctx) + " / " + (ctxMax ? fmtNum(ctxMax) + " tokens" : "max unavailable") : "no context data";
     const ctxCenter = live.context_pct != null ? Math.round(live.context_pct) + "%" : (ctx != null ? fmtTokens(ctx) : "—");
-    const note = live.source === "slots" ?
-      "Slot-observed and provisional; completed totals still come from /metrics." :
-      live.source === "metrics" ? "Latest completed /metrics observation; not a live slot." :
-        "No reliable runtime observation exists for this selection.";
     return '<div class="live-timing"><div class="live-timing-head"><span>RUNTIME TELEMETRY</span>' +
-      statusHtml + '</div>' + (live.model ? '<div class="runtime-variant">' + esc(live.model) +
-        (live.snapshot ? ' · ' + esc(live.snapshot) : "") + '</div>' : "") +
-      '<div class="runtime-layout"><div class="live-timing-grid">' +
+      statusHtml + '</div><div class="runtime-layout"><div class="runtime-main"><div class="live-timing-grid">' +
       item("slot", live.slot_id) + item("task", live.task_id) +
       item("n_gen", live.gen_tokens == null ? "—" : fmtNum(live.gen_tokens)) +
       item("tg avg", live.gen_tps_avg != null ? live.gen_tps_avg.toFixed(2) + " t/s" :
         live.processing ? "warming up" : "—") +
       item("tg 3s", live.gen_tps_3s != null ? live.gen_tps_3s.toFixed(2) + " t/s" :
         live.processing ? "warming up" : "—") +
-      item("observed", age) + '</div><div class="runtime-context">' +
+      item("observed", age) + '</div>' + (live.session_id != null ?
+        '<div class="runtime-chart-key"><span><i class="runtime-key-tps"></i>TK/S</span>' +
+        '<span><i class="runtime-key-context"></i>CONTEXT</span></div>' +
+        '<div class="runtime-chart" id="runtimeChart" role="img" aria-label="Generated tokens per second and context size across the current session"></div>' : "") +
+      '</div><div class="runtime-context">' +
       resourceGauge("CONTEXT", live.context_pct, ctxCenter, ctxDetail, "Context " + ctxDetail) +
-      '</div></div><div class="live-timing-note">' + esc(note) + '</div></div>';
+      '</div></div></div>';
   };
 
-  const updateRuntime = (live) => {
-    const target = el("selRuntime");
-    if (target) target.innerHTML = runtimeHtml(live);
+  const renderRuntimeChart = () => {
+    const box = el("runtimeChart");
+    if (!box || typeof echarts === "undefined" || !runtimeSeries.timestamps.length) return;
+    runtimeChart = echarts.init(box, null, { renderer: "canvas" });
+    runtimeChart.setOption({
+      animation: false,
+      backgroundColor: "transparent",
+      grid: { left: 30, right: 38, top: 3, bottom: 2 },
+      tooltip: {
+        trigger: "axis", backgroundColor: "#1e1e1b", borderColor: OC.border,
+        borderWidth: 1, padding: [5, 8], textStyle: { color: OC.text, fontSize: 10 },
+      },
+      xAxis: {
+        type: "category", show: false,
+        data: runtimeSeries.timestamps.map((ts) => fmtClock(ts, true)),
+      },
+      yAxis: [
+        { type: "value", scale: true, splitNumber: 1, splitLine: { lineStyle: { color: OC.split } },
+          axisLine: { show: false }, axisTick: { show: false },
+          axisLabel: { color: OC.orange, fontSize: 8, formatter: (v) => Number(v).toFixed(0) } },
+        { type: "value", scale: true, splitNumber: 1, splitLine: { show: false },
+          axisLine: { show: false }, axisTick: { show: false },
+          axisLabel: { color: OC.text, fontSize: 8, formatter: (v) => fmtTokens(v) } },
+      ],
+      series: [
+        { name: "tk/s", type: "line", yAxisIndex: 0, data: runtimeSeries.genTps,
+          showSymbol: false, smooth: 0.12, connectNulls: false,
+          lineStyle: { width: 1.35, color: OC.orange }, itemStyle: { color: OC.orange } },
+        { name: "context", type: "line", yAxisIndex: 1, data: runtimeSeries.context,
+          showSymbol: false, smooth: 0.12, connectNulls: false,
+          lineStyle: { width: 1, color: OC.text }, itemStyle: { color: OC.text } },
+      ],
+    });
   };
+
+  const updateRuntime = (live, seed) => {
+    const target = el("selRuntime");
+    if (!target) return;
+    syncRuntimeSeries(live || {}, !!seed);
+    disposeRuntimeChart();
+    target.innerHTML = runtimeHtml(live);
+    renderRuntimeChart();
+  };
+
+  window.addEventListener("resize", () => {
+    if (runtimeChart) { try { runtimeChart.resize(); } catch (e) {} }
+  });
 
   const renderSelected = (row) => {
     const box = el("selPanel");
@@ -445,7 +618,9 @@ function initModels(meta) {
       const live = s.live && !s.live.tasks ? s.live : (s.live && s.live.tasks ? s.live.tasks[0] : null);
       box.innerHTML =
         '<div class="sel-head"><span class="m-dot" style="background:' + esc(s.color) + '"></span>' +
-        '<span class="tag">SELECTED</span><span class="sel-name">' + esc(s.label) + "</span></div>" +
+        '<span class="tag">SELECTED</span><span class="sel-name">' + esc(s.label) + '</span>' +
+        '<a class="capture-btn" href="about:blank" target="_blank" data-capture-target="selPanel" data-capture-name="selected-model" ' +
+        'data-capture-ignore aria-label="Capture selected model card as an image">CAPTURE</a></div>' +
         '<div class="mc-sub" style="margin-top:2px">' + esc(s.provider || "") + " · range " + st.range + "</div>" +
         '<div id="selRuntime">' + runtimeHtml(s.realtime) + "</div>" +
         '<div class="sel-grid">' +
@@ -471,6 +646,7 @@ function initModels(meta) {
         '</span><span><i style="background:' + OC.green + '"></i>generated ' + fmtTokens(gt) + "</span></div>" +
         '<div id="selSpark" style="width:100%;height:34px;margin-top:10px"></div>';
       selectedWasActive = !!(s.realtime && ["LIVE", "FINALIZING"].includes(s.realtime.status));
+      updateRuntime(s.realtime, true);
       if (selChart) { try { selChart.dispose(); } catch (e) {} selChart = null; }
       selChart = sparkline(el("selSpark"), s.spark || [0], s.color);
     });
@@ -592,12 +768,12 @@ function initModels(meta) {
     selectedActive.sort((a, b) => (b.rank || 0) - (a.rank || 0) ||
       (b.task_count || 0) - (a.task_count || 0) || (b.latest_seen || 0) - (a.latest_seen || 0));
     if (selectedActive.length) {
-      updateRuntime(selectedActive[0].realtime);
+      updateRuntime(selectedActive[0].realtime, false);
       selectedWasActive = true;
     } else if (selectedWasActive && row) {
       selectedWasActive = false;
       api("/api/models/selected?ids=" + row.model_ids.join(",") + "&range=" + st.range)
-        .then((s) => { if (row.key === st.selectedKey) updateRuntime(s.realtime); })
+        .then((s) => { if (row.key === st.selectedKey) updateRuntime(s.realtime, true); })
         .catch(() => {});
     }
   };

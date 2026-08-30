@@ -227,6 +227,7 @@ class SlotSessionTests(unittest.TestCase):
                              start_at=now - 60_000, status="ACTIVE")
             session.add(run)
             session.commit()
+            session.refresh(run)
             data = metrics.sessions_page(session, None, None, None, None, None, "7d")
             self.assertEqual(data["sessions"][0]["status"], "INTERRUPTED")
             session.refresh(run)
@@ -264,6 +265,8 @@ class SlotSessionTests(unittest.TestCase):
             self.assertEqual(selected["realtime"]["status"], "LIVE")
             self.assertEqual(selected["realtime"]["model"], "family-q4")
             self.assertEqual(selected["realtime"]["context_pct"], 14.0)
+            self.assertEqual(selected["realtime"]["session_id"], run.id)
+            self.assertEqual(selected["realtime"]["session_started_at"], run.start_at)
 
     def test_closed_session_preserves_provisional_snapshot_for_selected_runtime(self):
         engine = memory_engine()
@@ -277,13 +280,15 @@ class SlotSessionTests(unittest.TestCase):
             session.add(model)
             session.commit()
             session.refresh(model)
-            session.add(SessionRow(
+            run = SessionRow(
                 provider_id=provider.id, model_id=model.id, start_at=now - 5000,
                 end_at=now - 1000, status="CLOSED", live_gen_tokens=90,
                 live_context=110, live_context_max=2048, live_seen_at=now - 1000,
                 source_slot_id=0, source_task_id=88, result_source="metrics",
-            ))
+            )
+            session.add(run)
             session.commit()
+            session.refresh(run)
 
             selected = metrics.selected_stats(session, [model.id], None, "today")
             realtime = selected["realtime"]
@@ -291,6 +296,7 @@ class SlotSessionTests(unittest.TestCase):
             self.assertEqual(realtime["snapshot"], "LAST SLOT")
             self.assertEqual(realtime["gen_tokens"], 90)
             self.assertTrue(realtime["provisional"])
+            self.assertEqual(realtime["session_id"], run.id)
 
     def test_selected_runtime_uses_honest_metrics_fallback_and_provider_health(self):
         engine = memory_engine()
@@ -321,6 +327,83 @@ class SlotSessionTests(unittest.TestCase):
             session.commit()
             realtime = metrics.selected_stats(session, [model.id], None, "today")["realtime"]
             self.assertEqual(realtime["status"], "STALE")
+
+    def test_runtime_history_preserves_nulls_and_live_point(self):
+        engine = memory_engine()
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="model", name="model")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            run = SessionRow(provider_id=provider.id, model_id=model.id,
+                             start_at=1000, status="ACTIVE")
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            session.add_all([
+                TelemetrySample(provider_id=provider.id, model_id=model.id,
+                                session_id=run.id, ts=1000, gen_tps=None,
+                                context_used=100),
+                TelemetrySample(provider_id=provider.id, model_id=model.id,
+                                session_id=run.id, ts=2000, gen_tps=10,
+                                context_used=None),
+            ])
+            session.commit()
+
+            history = metrics._runtime_history(session, {
+                "session_id": run.id, "session_started_at": run.start_at,
+                "observed_at": 3000, "gen_tps": None, "context": 300,
+            })
+            self.assertEqual(history["timestamps"], [1000, 2000, 3000])
+            self.assertEqual(history["gen_tps"], [None, 10, None])
+            self.assertEqual(history["context"], [100, None, 300])
+
+    def test_selected_runtime_history_is_bounded_across_current_session(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router", status="LIVE")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="model", name="model")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            run = SessionRow(
+                provider_id=provider.id, model_id=model.id, start_at=now - 240_000,
+                status="ACTIVE", source_slot_id=0, source_task_id=1,
+                live_context=4000, live_context_max=8192, live_gen_tps=42,
+                live_seen_at=now,
+            )
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            session.add_all([
+                TelemetrySample(
+                    provider_id=provider.id, model_id=model.id, session_id=run.id,
+                    ts=run.start_at + index * 1000, state="GENERATING",
+                    gen_tps=20 + index / 10, context_used=1000 + index * 10,
+                )
+                for index in range(240)
+            ])
+            session.commit()
+
+            realtime = metrics.selected_stats(
+                session, [model.id], provider.id, "today",
+            )["realtime"]
+            history = realtime["history"]
+            self.assertEqual(realtime["session_id"], run.id)
+            self.assertLessEqual(len(history["timestamps"]), 120)
+            self.assertEqual(len(history["timestamps"]), len(history["gen_tps"]))
+            self.assertEqual(len(history["timestamps"]), len(history["context"]))
+            self.assertEqual(history["timestamps"][-1], now)
+            self.assertEqual(history["gen_tps"][-1], 42)
+            self.assertEqual(history["context"][-1], 4000)
 
 
 class CollectorLeaseTests(unittest.TestCase):

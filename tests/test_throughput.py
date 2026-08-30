@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest.mock import patch
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -26,6 +27,47 @@ def memory_engine():
 
 
 class ThroughputCalculationTests(unittest.TestCase):
+    def test_accumulate_interleaved_models_is_linear_and_preserves_tails(self):
+        class CountingSample:
+            model_id_reads = 0
+
+            def __init__(self, **values):
+                defaults = {
+                    "state": "IDLE", "tokens_total": 0, "prompt_total": 0,
+                    "gen_total": 0, "prompt_seconds_total": 0,
+                    "gen_seconds_total": 0, "prompt_tps": None, "gen_tps": None,
+                    "mtp_proposed_total": 0, "mtp_accepted_total": 0,
+                    "context_used": None,
+                }
+                defaults.update(values)
+                self.__dict__.update(defaults)
+
+            def __getattribute__(self, name):
+                if name == "model_id":
+                    type(self).model_id_reads += 1
+                return object.__getattribute__(self, name)
+
+        samples = [
+            CountingSample(model_id=1, ts=10_000),
+            CountingSample(model_id=2, ts=20_000),
+            CountingSample(model_id=2, ts=30_000, tokens_total=20,
+                           gen_total=20, gen_seconds_total=2),
+            CountingSample(model_id=1, ts=50_000, state="GENERATING",
+                           tokens_total=100, gen_total=100, gen_seconds_total=4),
+            CountingSample(model_id=3, ts=90_000),
+        ]
+        acc: dict[int, ModelAcc] = {}
+        accumulate(samples, acc, 0, 100_000, 100_000)
+
+        self.assertEqual(CountingSample.model_id_reads, len(samples))
+        self.assertEqual(acc[1].loaded_time, 90)
+        self.assertEqual(acc[1].gen_time, 4)
+        self.assertEqual(acc[1].idle_time, 86)
+        self.assertEqual(acc[2].loaded_time, 10)
+        self.assertEqual(acc[2].idle_time, 8)
+        self.assertEqual(acc[3].loaded_time, 10)
+        self.assertEqual(acc[3].idle_time, 10)
+
     def test_maps_authoritative_llama_duration_counters(self):
         mapped = map_metrics({
             "llamacpp:prompt_seconds_total": 8.24881,
@@ -220,10 +262,83 @@ class ThroughputMigrationTests(unittest.TestCase):
             version = session.exec(text(
                 "SELECT value FROM meta WHERE key='schema_version'"
             )).one()[0]
-            self.assertEqual(version, "6")
+            indexes = {row[1] for row in session.exec(text(
+                "PRAGMA index_list(telemetrysample)"
+            )).all()}
+            self.assertEqual(version, "7")
+            self.assertIn("ix_telemetrysample_provider_ts", indexes)
             self.assertEqual(run.gen_time_s, 60)
             self.assertEqual(run.avg_gen_tps, 50)
             self.assertEqual(run.peak_gen_tps, 50)
+
+
+class OverviewPerformanceRegressionTests(unittest.TestCase):
+    def test_overview_reuses_one_projected_history_query_without_semantic_drift(self):
+        engine = memory_engine()
+        now = 1_800_000_000_000
+        day = metrics.local_day_start_ms(now)
+        with Session(engine) as session:
+            provider = Provider(name="p", base_url="http://p", status="LIVE")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            first = Model(provider_id=provider.id, key="a", name="A", color="#111111")
+            second = Model(provider_id=provider.id, key="b", name="B", color="#222222")
+            session.add_all([first, second])
+            session.commit()
+            session.refresh(first)
+            session.refresh(second)
+            run = SessionRow(provider_id=provider.id, model_id=first.id,
+                             start_at=day + 50, end_at=day + 500,
+                             duration_s=0.45, gen_tokens=10, total_tokens=10,
+                             status="CLOSED")
+            session.add(run)
+            session.commit()
+            session.refresh(run)
+            session.add_all([
+                TelemetrySample(provider_id=provider.id, model_id=first.id,
+                                ts=day + 100, state="GENERATING", tokens_total=20,
+                                gen_total=20, gen_seconds_total=2),
+                TelemetrySample(provider_id=provider.id, model_id=second.id,
+                                ts=day + 150, state="GENERATING", tokens_total=100,
+                                gen_total=100, gen_seconds_total=10),
+                TelemetrySample(provider_id=provider.id, model_id=first.id,
+                                session_id=run.id, ts=day + 200, state="IDLE",
+                                tokens_total=30, gen_total=30, gen_seconds_total=3),
+                TelemetrySample(provider_id=provider.id, model_id=second.id,
+                                ts=day + 250, state="IDLE", tokens_total=5,
+                                gen_total=5, gen_seconds_total=1),
+                TelemetrySample(provider_id=provider.id, model_id=second.id,
+                                ts=day + 350, state="IDLE", tokens_total=12,
+                                gen_total=12, gen_seconds_total=2),
+            ])
+            session.commit()
+
+            telemetry_selects = []
+
+            def count_query(_conn, _cursor, statement, _parameters, _context, _many):
+                if statement.lstrip().upper().startswith("SELECT") and "telemetrysample" in statement:
+                    telemetry_selects.append(statement)
+
+            event.listen(engine, "before_cursor_execute", count_query)
+            try:
+                with patch("observatory.metrics.now_ms", return_value=now):
+                    result = metrics.overview(session)
+            finally:
+                event.remove(engine, "before_cursor_execute", count_query)
+
+            self.assertEqual(len(telemetry_selects), 2)
+            history_sql = telemetry_selects[-1].lower()
+            self.assertNotIn("telemetrysample.id", history_sql)
+            self.assertNotIn("telemetrysample.extra", history_sql)
+            self.assertEqual(result["today"]["tokens"], 17)
+            self.assertEqual(result["today"]["sessions"], 1)
+            self.assertEqual(
+                [(row["name"], row["tokens"]) for row in result["tokens_by_model"]],
+                [("A", 10), ("B", 7)],
+            )
+            self.assertEqual(result["recent_sessions"][0]["model"], "A")
+            self.assertEqual(result["current"]["model"], "B")
 
 
 if __name__ == "__main__":

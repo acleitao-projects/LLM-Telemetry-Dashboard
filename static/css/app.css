@@ -188,11 +188,22 @@ tr.selected .share-bar i { background: var(--blue); }
 .task-count { display: block; margin-top: 2px; color: var(--text-3); font-size: 9px; }
 
 /* ---------------------------------------------------------------- selected panel */
-.models-grid { display: grid; grid-template-columns: 3fr 2fr; gap: 12px; align-items: start; }
-.models-grid > .panel:first-child { overflow-x: auto; }
+.models-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.models-list-panel { grid-column: span 4; overflow-x: auto; padding: 8px 12px; }
+#selPanel { grid-column: span 2; }
 .sel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
 .sel-head .tag { font-size: 9.5px; letter-spacing: 0.12em; color: var(--text-3); font-weight: 600; }
 .sel-name { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.capture-row { display: flex; align-items: center; justify-content: space-between; min-width: max-content; margin-bottom: 3px; color: var(--text-3); font-size: 9px; font-weight: 600; letter-spacing: .1em; }
+.capture-btn {
+  flex: none; margin-left: auto; border: 1px solid var(--border-2); border-radius: 5px;
+  padding: 3px 7px; color: var(--text-2); background: var(--panel-3); cursor: pointer;
+  font: 600 8.5px/1.2 "Inter", "Segoe UI", sans-serif; letter-spacing: .09em;
+}
+.capture-btn::before { content: "□"; display: inline-block; margin-right: 4px; color: var(--blue); }
+.capture-btn:hover { color: var(--text); border-color: var(--text-3); }
+.capture-btn.is-capturing { cursor: wait; opacity: .55; }
+.sel-head .capture-btn { margin-left: auto; }
 .sel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
 .sel-metric { background: var(--panel-2); border: 1px solid #2a2a27; border-radius: 7px; padding: 8px 10px; }
 .sel-metric .l { font-size: 9px; letter-spacing: 0.1em; color: var(--text-3); font-weight: 600; text-transform: uppercase; }
@@ -203,24 +214,34 @@ tr.selected .share-bar i { background: var(--blue); }
 .legend { display: flex; gap: 12px; font-size: 10px; color: var(--text-2); }
 .legend i { display: inline-block; width: 7px; height: 7px; border-radius: 2px; margin-right: 4px; }
 .live-timing {
-  margin-top: 9px; padding: 9px 10px; border: 1px solid #39342a; border-radius: 7px;
-  background: #171612; font-variant-numeric: tabular-nums;
+  margin-top: 9px; padding: 8px 10px; border: 1px solid #39342a; border-radius: 7px;
+  background: var(--panel); font-family: "IBM Plex Mono", "JetBrains Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
 }
-.live-timing-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.live-timing-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
 .live-timing-head span:first-child { font-size: 9px; letter-spacing: .11em; color: var(--text-3); font-weight: 700; }
 .runtime-badge { color: var(--text-2); font-size: 9px; font-weight: 700; letter-spacing: .08em; }
 .runtime-badge.status-live { color: #9fd4b8; }
 .runtime-badge.status-finalizing { color: #e4c07a; }
 .runtime-badge.status-offline, .runtime-badge.status-stale { color: #d99a96; }
-.runtime-variant { margin: -2px 0 7px; color: var(--text-2); font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.runtime-layout { display: grid; grid-template-columns: minmax(0, 1fr) 116px; align-items: center; gap: 10px; }
-.live-timing-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.runtime-layout { display: grid; grid-template-columns: minmax(0, 1fr) 108px; align-items: center; gap: 9px; }
+.runtime-main { min-width: 0; }
+.live-timing-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 8px; row-gap: 4px; }
 .live-timing-item { min-width: 0; }
 .live-timing-item i { display: block; color: var(--text-3); font-size: 8px; font-style: normal; letter-spacing: .08em; text-transform: uppercase; }
 .live-timing-item b { display: block; margin-top: 1px; color: var(--text); font-size: 11.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 .live-timing-note { margin-top: 5px; color: var(--text-3); font-size: 9px; }
 .runtime-context { border-left: 1px solid var(--border); padding-left: 9px; }
-@media (max-width: 1100px) {
+.runtime-context .resource-gauge svg { height: 76px; margin: -6px auto -9px; }
+.runtime-chart-key {
+  display: flex; justify-content: flex-end; gap: 10px; margin: 3px 1px -2px;
+  color: var(--text-3); font-size: 7.5px; font-weight: 700; letter-spacing: .07em;
+}
+.runtime-chart-key span { display: inline-flex; align-items: center; gap: 4px; }
+.runtime-chart-key i { display: inline-block; width: 9px; height: 1px; background: var(--orange); }
+.runtime-chart-key .runtime-key-context { background: var(--text-2); }
+.runtime-chart { width: 100%; height: 54px; min-width: 0; }
+@media (max-width: 700px) {
   .runtime-layout { grid-template-columns: 1fr; }
   .runtime-context { border-left: 0; border-top: 1px solid var(--border); padding: 7px 0 0; max-width: 140px; }
 }
@@ -344,7 +365,14 @@ details.cfg-details[open] summary { color: var(--text); }
 
 @media (max-width: 1100px) {
   .metric-strip { grid-template-columns: repeat(3, 1fr); }
-  .models-grid { grid-template-columns: 1fr; }
+  .models-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .models-list-panel { grid-column: span 1; }
+  #selPanel { grid-column: span 2; }
   .ov-top, .ov-charts, .ov-charts-2 { grid-template-columns: 1fr; }
   .gpu-detail-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 800px) {
+  .models-grid { grid-template-columns: 1fr; }
+  .models-list-panel, #selPanel { grid-column: auto; }
 }

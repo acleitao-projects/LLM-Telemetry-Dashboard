@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import Index, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -137,6 +137,7 @@ class TelemetrySample(SQLModel, table=True):
 
     __table_args__ = (
         UniqueConstraint("provider_id", "model_id", "ts", name="uq_sample_prov_model_ts"),
+        Index("ix_telemetrysample_provider_ts", "provider_id", "ts"),
     )
 
 

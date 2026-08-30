@@ -10,7 +10,7 @@ from sqlalchemy.engine import Engine
 
 from . import models  # noqa: F401  (register tables)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _engine: Engine | None = None
 _db_path: str | None = None
@@ -176,6 +176,16 @@ def _migrate(engine: Engine) -> None:
                     ))
                 s.exec(text(
                     "UPDATE meta SET value = '6' WHERE key = 'schema_version'"
+                ))
+                s.commit()
+                version = 6
+            if version < 7:
+                s.exec(text(
+                    "CREATE INDEX IF NOT EXISTS ix_telemetrysample_provider_ts "
+                    "ON telemetrysample (provider_id, ts)"
+                ))
+                s.exec(text(
+                    "UPDATE meta SET value = '7' WHERE key = 'schema_version'"
                 ))
                 s.commit()
             if version > SCHEMA_VERSION:
