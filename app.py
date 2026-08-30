@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from typing import Optional
 from uuid import UUID
@@ -84,6 +85,34 @@ def create_app(demo: bool = False) -> FastAPI:
     app.state.started = time.time()
     app.state.collector = None
     templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+    overview_cache = {"data": None, "refreshed": 0.0, "refreshing": False}
+    overview_lock = threading.Lock()
+
+    def refresh_overview():
+        try:
+            with odb.new_session() as s:
+                data = m.overview(s)
+            with overview_lock:
+                overview_cache["data"] = data
+                overview_cache["refreshed"] = time.monotonic()
+        finally:
+            with overview_lock:
+                overview_cache["refreshing"] = False
+
+    def cached_overview():
+        with overview_lock:
+            data = overview_cache["data"]
+            stale = time.monotonic() - overview_cache["refreshed"] >= 5.0
+            if data is not None and stale and not overview_cache["refreshing"]:
+                overview_cache["refreshing"] = True
+                threading.Thread(target=refresh_overview, name="overview-cache",
+                                 daemon=True).start()
+        if data is not None:
+            return data
+        refresh_overview()
+        with overview_lock:
+            return overview_cache["data"]
+
     app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")),
               name="static")
 
@@ -218,8 +247,7 @@ def create_app(demo: bool = False) -> FastAPI:
 
     @app.get("/api/overview")
     def api_overview():
-        with odb.new_session() as s:
-            return m.overview(s)
+        return cached_overview()
 
     @app.get("/api/models")
     def api_models(range: str = "7d", group: str = "family",
@@ -294,11 +322,14 @@ def create_app(demo: bool = False) -> FastAPI:
 
     @app.get("/api/stream")
     async def api_stream():
+        def snapshot():
+            with odb.new_session() as s:
+                return m.live_snapshot(s)
+
         async def gen():
             while True:
                 try:
-                    with odb.new_session() as s:
-                        data = m.live_snapshot(s)
+                    data = await asyncio.to_thread(snapshot)
                 except Exception:
                     data = {"error": "unavailable", "now": now_ms()}
                 yield f"data: {json.dumps(data)}\n\n"
@@ -391,6 +422,11 @@ def create_app(demo: bool = False) -> FastAPI:
     @app.on_event("startup")
     async def start_screenshot_cleanup():
         app.state.screenshot_cleanup_task = asyncio.create_task(_screenshot_cleanup_loop())
+        try:
+            await asyncio.to_thread(refresh_overview)
+        except RuntimeError:
+            # Artifact-only tests create the app without configuring a database.
+            pass
 
     @app.on_event("shutdown")
     def shutdown_collector():
