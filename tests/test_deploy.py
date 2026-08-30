@@ -10,6 +10,12 @@ class DeployScriptTests(unittest.TestCase):
         self.assertIn("HEALTH_URL=http://127.0.0.1:8090/api/meta", script)
         self.assertNotIn("HEALTH_URL=http://127.0.0.1:8090/api/overview", script)
 
+    def test_old_release_cleanup_is_guarded_and_can_remove_service_owned_files(self):
+        script = (pathlib.Path(__file__).parents[1] / "deploy" / "deploy.sh").read_text(encoding="utf-8")
+        self.assertIn('resolved_old_release=$(readlink -f "${old_release}")', script)
+        self.assertIn('[[ ${resolved_old_release} == "${RELEASES_DIR}/"*', script)
+        self.assertIn('sudo rm -rf -- "${resolved_old_release}"', script)
+
 
 if __name__ == "__main__":
     unittest.main()

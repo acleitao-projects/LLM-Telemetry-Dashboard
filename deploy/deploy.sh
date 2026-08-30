@@ -58,8 +58,10 @@ fi
 
 mapfile -t OLD_RELEASES < <(find "${RELEASES_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +6 | cut -d' ' -f2-)
 for old_release in "${OLD_RELEASES[@]}"; do
-  if [[ $(readlink -f "${APP_ROOT}/current") != $(readlink -f "${old_release}") ]]; then
-    rm -rf -- "${old_release}"
+  resolved_old_release=$(readlink -f "${old_release}")
+  if [[ ${resolved_old_release} == "${RELEASES_DIR}/"* \
+    && $(readlink -f "${APP_ROOT}/current") != "${resolved_old_release}" ]]; then
+    sudo rm -rf -- "${resolved_old_release}"
   fi
 done
 
