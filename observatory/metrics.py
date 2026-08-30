@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 from typing import NamedTuple, Optional
 
+from sqlalchemy import bindparam, text
 from sqlmodel import Session, select
 
 from . import database as db
@@ -642,6 +643,111 @@ def accumulate(samples: list[TelemetrySample], acc: dict[int, ModelAcc],
         a.idle_time = max(0.0, a.loaded_time - a.prompt_time - a.gen_time)
 
 
+def aggregate_samples(s: Session, prov_ids: list[int], start_ms: int,
+                      end_ms: int, now: int) -> dict[int, ModelAcc]:
+    """Aggregate one telemetry window in SQLite without ORM materialization."""
+    if not prov_ids:
+        return {}
+    stmt = text("""
+        WITH ordered AS (
+            SELECT current.model_id, current.ts, current.state,
+                   current.tokens_total, current.prompt_total, current.gen_total,
+                   current.prompt_seconds_total, current.gen_seconds_total,
+                   current.prompt_tps, current.gen_tps,
+                   current.mtp_proposed_total, current.mtp_accepted_total,
+                   current.context_used,
+                   previous.ts AS prev_ts, previous.state AS prev_state,
+                   previous.tokens_total AS prev_tokens_total,
+                   previous.prompt_total AS prev_prompt_total,
+                   previous.gen_total AS prev_gen_total,
+                   previous.prompt_seconds_total AS prev_prompt_seconds,
+                   previous.gen_seconds_total AS prev_gen_seconds,
+                   previous.mtp_proposed_total AS prev_proposed,
+                   previous.mtp_accepted_total AS prev_accepted,
+                   NOT EXISTS (
+                       SELECT 1 FROM telemetrysample AS later
+                       WHERE later.provider_id = current.provider_id
+                         AND later.model_id = current.model_id
+                         AND later.ts > current.ts AND later.ts <= :end_ms
+                   ) AS is_last
+            FROM telemetrysample AS current
+            LEFT JOIN telemetrysample AS previous ON previous.id = (
+                SELECT candidate.id FROM telemetrysample AS candidate
+                WHERE candidate.provider_id = current.provider_id
+                  AND candidate.model_id = current.model_id
+                  AND candidate.ts >= :start_ms AND candidate.ts < current.ts
+                ORDER BY candidate.ts DESC LIMIT 1
+            )
+            WHERE current.provider_id IN :provider_ids
+              AND current.ts >= :start_ms AND current.ts <= :end_ms
+        ), deltas AS (
+            SELECT *,
+                   CASE WHEN tokens_total > prev_tokens_total
+                        THEN tokens_total - prev_tokens_total ELSE 0 END AS token_delta,
+                   CASE WHEN prompt_total > prev_prompt_total
+                        THEN prompt_total - prev_prompt_total ELSE 0 END AS prompt_delta,
+                   CASE WHEN gen_total > prev_gen_total
+                        THEN gen_total - prev_gen_total ELSE 0 END AS gen_delta,
+                   CASE WHEN mtp_proposed_total > prev_proposed
+                        THEN mtp_proposed_total - prev_proposed ELSE 0 END AS proposed_delta,
+                   CASE WHEN mtp_accepted_total > prev_accepted
+                        THEN mtp_accepted_total - prev_accepted ELSE 0 END AS accepted_delta,
+                   CASE WHEN prev_state IN ('IDLE', 'PROMPTING', 'GENERATING')
+                        THEN MIN(:dt_cap, MAX(0.0, (ts - prev_ts) / 1000.0))
+                        ELSE 0 END AS loaded_delta
+            FROM ordered
+        )
+        SELECT model_id,
+               SUM(token_delta), SUM(prompt_delta), SUM(gen_delta),
+               SUM(proposed_delta), SUM(accepted_delta),
+               SUM(CASE WHEN prompt_delta > 0 THEN
+                       CASE WHEN prompt_seconds_total > prev_prompt_seconds
+                            THEN prompt_seconds_total - prev_prompt_seconds
+                            WHEN prompt_tps > 0 THEN prompt_delta / prompt_tps
+                            ELSE 0 END
+                   ELSE 0 END) AS prompt_time,
+               SUM(CASE WHEN gen_delta > 0 THEN
+                       CASE WHEN gen_seconds_total > prev_gen_seconds
+                            THEN gen_seconds_total - prev_gen_seconds
+                            WHEN gen_tps > 0 THEN gen_delta / gen_tps
+                            ELSE 0 END
+                   ELSE 0 END) AS gen_time,
+               SUM(loaded_delta) + MAX(CASE
+                   WHEN is_last
+                    AND state IN ('IDLE', 'PROMPTING', 'GENERATING')
+                    AND :now_ms - ts < 60000
+                   THEN MIN(60.0, (:now_ms - ts) / 1000.0)
+                   ELSE 0 END) AS loaded_time,
+               MAX(gen_tps), MAX(prompt_tps), MAX(context_used)
+        FROM deltas
+        GROUP BY model_id
+    """).bindparams(bindparam("provider_ids", expanding=True))
+    rows = s.execute(stmt, {
+        "provider_ids": prov_ids, "start_ms": start_ms, "end_ms": end_ms,
+        "now_ms": now, "dt_cap": DT_CAP_S,
+    }).all()
+    out: dict[int, ModelAcc] = {}
+    for row in rows:
+        a = ModelAcc()
+        (mid, a.tokens, a.prompt_tokens, a.gen_tokens, a.d_proposed,
+         a.d_accepted, a.prompt_time, a.gen_time, a.loaded_time,
+         a.peak_gen, a.peak_prompt, a.context_max) = row
+        a.tokens = a.tokens or 0.0
+        a.prompt_tokens = a.prompt_tokens or 0.0
+        a.gen_tokens = a.gen_tokens or 0.0
+        a.d_proposed = a.d_proposed or 0.0
+        a.d_accepted = a.d_accepted or 0.0
+        a.prompt_time = a.prompt_time or 0.0
+        a.gen_time = a.gen_time or 0.0
+        a.loaded_time = a.loaded_time or 0.0
+        a.peak_gen = a.peak_gen or 0.0
+        a.peak_prompt = a.peak_prompt or 0.0
+        a.context_max = a.context_max or 0
+        a.idle_time = max(0.0, a.loaded_time - a.prompt_time - a.gen_time)
+        out[mid] = a
+    return out
+
+
 def sessions_in_range(s: Session, prov_ids: list[int], start_ms: int,
                       model_ids: Optional[list[int]] = None) -> list[SessionRow]:
     q = select(SessionRow).where(
@@ -947,10 +1053,7 @@ def overview(s: Session, provider_id: Optional[int] = None) -> dict:
     h0 = now - 24 * 3600_000
     w7 = now - 7 * 86400_000
     prov_ids = [p.id for p in provs]
-    history_samples = fetch_overview_samples(s, prov_ids, w7)
-    samples = [r for r in history_samples if r.ts >= day_start]
-    acc: dict[int, ModelAcc] = {}
-    accumulate(samples, acc, day_start, now, now)
+    acc = aggregate_samples(s, prov_ids, day_start, now, now)
     today = {
         "tokens": round(sum(a.tokens for a in acc.values())),
         "inference_s": round(sum(a.prompt_time + a.gen_time for a in acc.values())),
@@ -962,7 +1065,7 @@ def overview(s: Session, provider_id: Optional[int] = None) -> dict:
                             if today["loaded_s"] > 0 else None)
 
     # model usage over last 24h (hourly buckets)
-    samples24 = [r for r in history_samples if r.ts >= h0]
+    samples24 = fetch_overview_samples(s, prov_ids, h0)
     per_model: dict[int, list[int]] = {}
     for r in samples24:
         if r.model_id is None:
@@ -994,9 +1097,7 @@ def overview(s: Session, provider_id: Optional[int] = None) -> dict:
                    for i in range(24)]
 
     # inference time by model (7d) + tokens by model (7d)
-    s7 = history_samples
-    acc7: dict[int, ModelAcc] = {}
-    accumulate(s7, acc7, w7, now, now)
+    acc7 = aggregate_samples(s, prov_ids, w7, now, now)
     inference_by_model = []
     tokens_by_model = []
     for mid, a in acc7.items():
@@ -1077,9 +1178,7 @@ def live_snapshot(s: Session) -> dict:
             current["context_max"] = current["live"].get("context_max") or current["context_max"]
             current["context_pct"] = current["live"].get("context_pct")
     day_start = local_day_start_ms(now)
-    samples = fetch_samples(s, [p.id for p in provs], day_start)
-    acc: dict[int, ModelAcc] = {}
-    accumulate(samples, acc, day_start, now, now)
+    acc = aggregate_samples(s, [p.id for p in provs], day_start, now, now)
     today = {
         "tokens": round(sum(a.tokens for a in acc.values())),
         "inference_s": round(sum(a.prompt_time + a.gen_time for a in acc.values())),
