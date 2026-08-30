@@ -68,6 +68,9 @@ class ProviderSettingsTests(unittest.TestCase):
             if url.endswith("/metrics"):
                 self.assertEqual(kwargs.get("params"), {"model": "hot model"})
                 return Response({})
+            if url.endswith("/slots"):
+                self.assertEqual(kwargs.get("params"), {"model": "hot model"})
+                return Response([])
             if url.endswith("/props"):
                 return Response({})
             raise AssertionError(f"unexpected URL: {url}")

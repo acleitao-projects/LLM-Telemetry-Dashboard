@@ -194,8 +194,25 @@ class SessionRow(SQLModel, table=True):
     vram_used_mb: Optional[float] = None
     ram_used_mb: Optional[float] = None
     power_w: Optional[float] = None
-    status: str = "ACTIVE"                 # ACTIVE / CLOSED
+    status: str = "ACTIVE"                 # ACTIVE / FINALIZING / CLOSED / INTERRUPTED / INCOMPLETE
+    source_slot_id: Optional[int] = Field(default=None, index=True)
+    source_task_id: Optional[int] = Field(default=None, index=True)
+    live_prompt_tokens: Optional[float] = None
+    live_gen_tokens: Optional[float] = None
+    live_context: Optional[int] = None
+    live_gen_tps: Optional[float] = None
+    live_seen_at: Optional[int] = Field(default=None, index=True)
+    result_source: Optional[str] = None      # metrics / slots / incomplete
     created_at: int = Field(default_factory=now_ms)
+
+
+class CollectorLease(SQLModel, table=True):
+    """Single-writer lease for one SQLite database."""
+    __tablename__ = "collectorlease"
+
+    key: str = Field(primary_key=True)
+    owner_id: str = Field(index=True)
+    heartbeat_at: int = Field(index=True)
 
 
 class Setting(SQLModel, table=True):

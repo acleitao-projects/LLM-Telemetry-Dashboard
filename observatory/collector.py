@@ -10,6 +10,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 from typing import Callable, Optional
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -19,13 +20,13 @@ from . import database as db
 from .llama_provider import (AgentClient, config_fingerprint,
                              extract_config, map_metrics)
 from .metrics import next_model_color, parse_model_name
-from .models import (BuildInfo, GpuTelemetrySample, HardwareInfo, Model,
+from .models import (BuildInfo, CollectorLease, GpuTelemetrySample, HardwareInfo, Model,
                      ModelConfig, Provider, SessionRow, TelemetrySample, now_ms)
 from .settings import (AGENT_POLL_S, BUCKET_FULL_S, BUCKET_MID_S, LLAMA_POLL_S,
                         MODELS_POLL_S, PROPS_POLL_S, QUANT_TOKENS, RETENTION_FULL_S,
                         RETENTION_MID_S, RETENTION_RAW_S, RETENTION_SWEEP_S,
                         SESSION_END_DELAY_S, SAMPLE_DT_MAX_S)
-from .session_tracker import (ProviderState, SessionStats, counter_reset,
+from .session_tracker import (LiveTaskState, ProviderState, SessionStats, counter_reset,
                               detect_state, safe_delta)
 
 log = logging.getLogger("observatory.collector")
@@ -35,6 +36,10 @@ COUNTER_KEYS = ("tokens_total", "prompt_total", "gen_total",
                 "mtp_proposed_total", "mtp_accepted_total")
 
 MTP_WINDOW_S = 30.0
+LIVE_FINALIZE_GRACE_S = 10.0
+LIVE_SPEED_WINDOW_S = 8.0
+LEASE_STALE_MS = 10_000
+LEASE_RETRY_S = 2.0
 
 
 def _phase_duration(token_delta: float, seconds_delta: float,
@@ -47,6 +52,30 @@ def _phase_duration(token_delta: float, seconds_delta: float,
     if throughput is not None and throughput > 0:
         return token_delta / throughput
     return 0.0
+
+
+def _slot_snapshots(payload: object) -> list[dict]:
+    """Extract only the numeric live fields LLM-Telemetry is allowed to retain."""
+    out: list[dict] = []
+    if not isinstance(payload, list):
+        return out
+    for raw in payload:
+        if not isinstance(raw, dict) or not raw.get("is_processing"):
+            continue
+        slot_id = _opt_int(raw.get("id"))
+        task_id = _opt_int(raw.get("id_task"))
+        if slot_id is None or task_id is None:
+            continue
+        nxt = raw.get("next_token")
+        nxt0 = nxt[0] if isinstance(nxt, list) and nxt and isinstance(nxt[0], dict) else {}
+        out.append({
+            "slot_id": slot_id,
+            "task_id": task_id,
+            "prompt_tokens": float(_opt_int(raw.get("n_prompt_tokens_processed")) or 0),
+            "gen_tokens": float(_opt_int(nxt0.get("n_decoded")) or 0),
+            "context": _opt_int(raw.get("n_prompt_tokens")),
+        })
+    return out
 
 
 def parse_cmdline(argv: list[str]) -> dict:
@@ -214,6 +243,9 @@ class Collector:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.started_at = time.time()
+        self.owner_id = str(uuid.uuid4())
+        self.role = "standby"
+        self._last_lease_attempt = 0.0
 
     # ------------------------------------------------------------------ life
     def start(self):
@@ -232,6 +264,55 @@ class Collector:
                 c.close()
             except Exception:
                 pass
+        self._release_lease()
+
+    def lease_status(self) -> dict:
+        return {"role": self.role, "owner_id": self.owner_id if self.role == "active" else None}
+
+    def endpoint_status(self) -> dict[int, dict]:
+        out: dict[int, dict] = {}
+        for (provider_id, _), state in self.model_states.items():
+            item = out.setdefault(provider_id, {"slots": None})
+            if state.slots_available is True:
+                item["slots"] = True
+            elif item["slots"] is None and state.slots_available is False:
+                item["slots"] = False
+        return out
+
+    def _ensure_lease(self, now: float) -> bool:
+        if self.role != "active" and now - self._last_lease_attempt < LEASE_RETRY_S:
+            return False
+        self._last_lease_attempt = now
+        heartbeat = int(now * 1000)
+        cutoff = heartbeat - LEASE_STALE_MS
+        with db.new_session() as s:
+            stmt = sqlite_insert(CollectorLease).values(
+                key="collector", owner_id=self.owner_id, heartbeat_at=heartbeat,
+            ).on_conflict_do_update(
+                index_elements=[CollectorLease.key],
+                set_={"owner_id": self.owner_id, "heartbeat_at": heartbeat},
+                where=((CollectorLease.owner_id == self.owner_id) |
+                       (CollectorLease.heartbeat_at < cutoff)),
+            )
+            s.exec(stmt)
+            s.commit()
+            row = s.get(CollectorLease, "collector")
+            acquired = bool(row and row.owner_id == self.owner_id)
+        self.role = "active" if acquired else "standby"
+        return acquired
+
+    def _release_lease(self):
+        if self.role != "active":
+            return
+        try:
+            with db.new_session() as s:
+                row = s.get(CollectorLease, "collector")
+                if row and row.owner_id == self.owner_id:
+                    s.delete(row)
+                    s.commit()
+        except Exception:
+            log.exception("failed releasing collector lease")
+        self.role = "standby"
 
     # ----------------------------------------------------------------- loop
     def _loop(self):
@@ -252,6 +333,8 @@ class Collector:
 
     def _tick(self):
         now = time.time()
+        if not self._ensure_lease(now):
+            return
         with db.new_session() as s:
             providers = s.exec(select(Provider).order_by(Provider.id)).all()
             pids = {p.id for p in providers if p.enabled}
@@ -272,15 +355,19 @@ class Collector:
                     self._poll_fail(p, st, e)
 
     def _drop_provider(self, pid: int):
-        self.states.pop(pid, None)
         ts = int(time.time() * 1000)
         try:
             with db.new_session() as s:
                 for (pid2, _mk), st_m in list(self.model_states.items()):
-                    if pid2 == pid and st_m.active_session_id:
+                    if pid2 != pid:
+                        continue
+                    if st_m.live_tasks:
+                        self._end_live_tasks(s, st_m, ts, "INTERRUPTED")
+                    elif st_m.active_session_id:
                         self._close_session(s, st_m, ts)
         except Exception:
             log.exception("failed closing sessions on provider drop")
+        self.states.pop(pid, None)
         for k in [k for k in self.model_states if k[0] == pid]:
             del self.model_states[k]
         c = self.clients.pop(pid, None)
@@ -402,7 +489,9 @@ class Collector:
             for k in [k for k in self.model_states
                       if k[0] == provider.id and k[1] not in known_keys]:
                 st_m = self.model_states.pop(k)
-                if st_m.active_session_id:
+                if st_m.live_tasks:
+                    self._end_live_tasks(s, st_m, ts_ms, "INCOMPLETE")
+                elif st_m.active_session_id:
                     self._close_session(s, st_m, ts_ms)
             if loaded_count and metrics_ok == 0:
                 raise RuntimeError("; ".join(metrics_errors) or
@@ -432,14 +521,18 @@ class Collector:
             provider = s.get(Provider, p.id)
             if provider is None:
                 return
-            for (pid2, _mk), st_m in list(self.model_states.items()):
-                if pid2 == p.id and st_m.active_session_id:
-                    self._close_session(s, st_m, now_ms_v)
             last = provider.last_success_at
             if last and (now_ms_v - last) < 20_000:
                 provider.status = "STALE"
             else:
                 provider.status = "OFFLINE"
+                for (pid2, _mk), st_m in list(self.model_states.items()):
+                    if pid2 != p.id:
+                        continue
+                    if st_m.live_tasks:
+                        self._end_live_tasks(s, st_m, now_ms_v, "INTERRUPTED")
+                    elif st_m.active_session_id:
+                        self._close_session(s, st_m, now_ms_v)
             provider.fail_streak = st.fail_streak
             provider.last_error = str(err)[:300]
             s.commit()
@@ -458,8 +551,6 @@ class Collector:
             raw_metrics = client.metrics(mk)
         except Exception as e:
             st_m.metrics_fail += 1
-            if st_m.metrics_fail >= 3 and st_m.active_session_id:
-                self._close_session(s, st_m, ts_ms)
             return f"metrics failed for {mk}: {str(e)[:160]}"
         st_m.metrics_fail = 0
         mapped = map_metrics(raw_metrics)
@@ -486,6 +577,14 @@ class Collector:
         if cfg:
             self._upsert_model_config(s, st_m, model, cfg)
 
+        slots: list[dict] = []
+        try:
+            slots = _slot_snapshots(client.slots(mk))
+            st_m.slots_available = True
+            self._sync_live_tasks(s, provider, st_m, cfg, slots, ts_ms, now)
+        except Exception:
+            st_m.slots_available = False
+
         # counters / resets
         cur = {k: mapped.get(k) for k in COUNTER_KEYS}
         reset = st_m.last_ts is not None and counter_reset(st_m.prev, cur, COUNTER_KEYS)
@@ -505,15 +604,43 @@ class Collector:
         if gen_tps is None and gen_duration > 0:
             gen_tps = d_gen / gen_duration
 
-        state = detect_state((health or {}).get("status"), d_prompt, d_gen, True)
+        active_live = [task for task in st_m.live_tasks.values()
+                       if task.finalizing_since is None]
+        slots_busy = bool(active_live) or float(mapped.get("slots_processing") or 0) > 0
+        if active_live:
+            state = "GENERATING" if any(task.gen_tokens > 0 for task in active_live) else "PROMPTING"
+        elif slots_busy:
+            state = "GENERATING"
+        else:
+            state = detect_state((health or {}).get("status"), d_prompt, d_gen, True)
         activity = d_prompt > 0 or d_gen > 0
+        if slots_busy and not active_live and not st_m.active_session_id and st_m.model_id:
+            sess = SessionRow(
+                provider_id=provider.id, model_id=st_m.model_id,
+                config_id=st_m.config_id, start_at=ts_ms, status="ACTIVE",
+                live_seen_at=ts_ms, mtp_enabled=bool(cfg.get("mtp_enabled")),
+            )
+            s.add(sess)
+            s.commit()
+            s.refresh(sess)
+            st_m.active_session_id = sess.id
+            st_m.stats = SessionStats()
+        if slots_busy and st_m.active_session_id:
+            busy_session = s.get(SessionRow, st_m.active_session_id)
+            if busy_session:
+                busy_session.live_seen_at = ts_ms
+                s.add(busy_session)
+                s.commit()
+            st_m.last_activity_ts = now
         # sessions
         if reset:
-            if st_m.active_session_id:
+            if st_m.active_session_id and not st_m.live_tasks:
                 self._close_session(s, st_m, int((st_m.last_ts or now) * 1000))
             st_m.epoch += 1
             activity = False
-        if st_m.active_session_id and not activity and st_m.last_activity_ts and \
+        if st_m.active_session_id and not activity and not slots_busy and \
+                not st_m.live_tasks and \
+                st_m.last_activity_ts and \
                 (now - st_m.last_activity_ts) > SESSION_END_DELAY_S:
             self._close_session(s, st_m, int(st_m.last_activity_ts * 1000))
         if st_m.active_session_id and not reset and st_m.last_ts and \
@@ -526,6 +653,7 @@ class Collector:
                 sess = SessionRow(
                     provider_id=provider.id, model_id=st_m.model_id, config_id=st_m.config_id,
                     start_at=ts_ms, status="ACTIVE",
+                    live_seen_at=ts_ms,
                     mtp_enabled=bool(cfg.get("mtp_enabled")) or (d_prop > 0),
                 )
                 s.add(sess)
@@ -537,6 +665,10 @@ class Collector:
                 st_m.prompt_phase_start_ts = None
             stats = st_m.stats or SessionStats()
             st_m.stats = stats
+            live_row = s.get(SessionRow, st_m.active_session_id)
+            if live_row:
+                live_row.live_seen_at = ts_ms
+                s.add(live_row)
             stats.prompt_tokens += d_prompt
             stats.gen_tokens += d_gen
             if d_prompt > 0:
@@ -572,6 +704,22 @@ class Collector:
                 ttft = max(0.0, st_m.first_gen_ts - st_m.prompt_phase_start_ts)
             macc = (stats.mtp_accepted / stats.mtp_proposed * 100.0) if stats.mtp_proposed > 0 else None
             self._update_session_row(s, st_m, ttft, macc)
+            observed_session = s.get(SessionRow, st_m.active_session_id)
+            if observed_session:
+                observed_session.result_source = "metrics"
+                s.add(observed_session)
+                s.commit()
+            finalizing = [key for key, task in st_m.live_tasks.items()
+                          if task.finalizing_since is not None and
+                          task.session_id == st_m.active_session_id]
+            if len(finalizing) == 1 and not active_live:
+                sess = s.get(SessionRow, st_m.active_session_id)
+                if sess:
+                    sess.result_source = "metrics"
+                    s.add(sess)
+                    s.commit()
+                self._close_session(s, st_m, ts_ms)
+                st_m.live_tasks.pop(finalizing[0], None)
 
         # rolling MTP acceptance window
         st_m.mtp_window.append((now, d_prop, d_acc))
@@ -615,10 +763,126 @@ class Collector:
         st_m.last_ts = now
         return None
 
+    def _sync_live_tasks(self, s: Session, provider: Provider, st: ProviderState,
+                         cfg: dict, slots: list[dict], ts_ms: int, now: float):
+        """Create/update task sessions from sanitized /slots observations."""
+        seen: set[str] = set()
+        for snap in slots:
+            key = f"{snap['slot_id']}:{snap['task_id']}"
+            seen.add(key)
+            task = st.live_tasks.get(key)
+            if task is None:
+                row = s.exec(select(SessionRow).where(
+                    SessionRow.provider_id == provider.id,
+                    SessionRow.model_id == st.model_id,
+                    SessionRow.source_slot_id == snap["slot_id"],
+                    SessionRow.source_task_id == snap["task_id"],
+                    SessionRow.status.in_(["ACTIVE", "FINALIZING"]),
+                ).order_by(SessionRow.start_at.desc())).first()
+                if row is None:
+                    row = SessionRow(
+                        provider_id=provider.id, model_id=st.model_id,
+                        config_id=st.config_id, start_at=ts_ms, status="ACTIVE",
+                        source_slot_id=snap["slot_id"],
+                        source_task_id=snap["task_id"],
+                        mtp_enabled=bool(cfg.get("mtp_enabled")),
+                    )
+                    s.add(row)
+                    s.commit()
+                    s.refresh(row)
+                task = LiveTaskState(
+                    slot_id=snap["slot_id"], task_id=snap["task_id"],
+                    session_id=row.id, first_seen=now, last_seen=now,
+                )
+                st.live_tasks[key] = task
+            task.last_seen = now
+            task.finalizing_since = None
+            gen_tokens = float(snap.get("gen_tokens") or 0)
+            if task.speed_points and gen_tokens < task.speed_points[-1][1]:
+                task.speed_points.clear()
+            task.speed_points.append((now, gen_tokens))
+            task.speed_points = [(t, value) for t, value in task.speed_points
+                                 if now - t <= LIVE_SPEED_WINDOW_S]
+            live_tps = None
+            if len(task.speed_points) >= 2:
+                t0, v0 = task.speed_points[0]
+                dt = now - t0
+                if dt > 0 and gen_tokens >= v0:
+                    live_tps = (gen_tokens - v0) / dt
+            task.prompt_tokens = float(snap.get("prompt_tokens") or 0)
+            task.gen_tokens = gen_tokens
+            task.context = snap.get("context")
+            row = s.get(SessionRow, task.session_id)
+            if row:
+                row.status = "ACTIVE"
+                row.end_at = None
+                row.live_prompt_tokens = task.prompt_tokens
+                row.live_gen_tokens = task.gen_tokens
+                row.live_context = task.context
+                row.live_gen_tps = live_tps
+                row.live_seen_at = ts_ms
+                s.add(row)
+            st.last_activity_ts = now
+
+        for key, task in list(st.live_tasks.items()):
+            if key in seen:
+                continue
+            row = s.get(SessionRow, task.session_id)
+            if task.finalizing_since is None:
+                task.finalizing_since = now
+                if row:
+                    row.status = "FINALIZING"
+                    s.add(row)
+            elif now - task.finalizing_since >= LIVE_FINALIZE_GRACE_S:
+                if row:
+                    has_metrics = row.result_source == "metrics"
+                    row.status = "CLOSED" if has_metrics else "INCOMPLETE"
+                    row.result_source = "metrics" if has_metrics else "incomplete"
+                    row.end_at = int(task.last_seen * 1000)
+                    row.duration_s = max(0.0, (row.end_at - row.start_at) / 1000.0)
+                    if has_metrics:
+                        row.live_prompt_tokens = None
+                        row.live_gen_tokens = None
+                        row.live_context = None
+                        row.live_gen_tps = None
+                    s.add(row)
+                st.live_tasks.pop(key, None)
+
+        candidates = list(st.live_tasks.values())
+        if len(candidates) == 1:
+            task = candidates[0]
+            st.active_session_id = task.session_id
+            if st.stats is None:
+                row = s.get(SessionRow, task.session_id)
+                st.stats = self._stats_from_session(row) if row else SessionStats()
+        elif len(candidates) > 1:
+            st.active_session_id = None
+            st.stats = None
+        elif st.active_session_id and st.slots_available:
+            st.active_session_id = None
+            st.stats = None
+        s.commit()
+
+    @staticmethod
+    def _stats_from_session(row: SessionRow) -> SessionStats:
+        stats = SessionStats()
+        stats.prompt_tokens = float(row.prompt_tokens or 0)
+        stats.gen_tokens = float(row.gen_tokens or 0)
+        stats.prompt_time_s = float(row.prompt_time_s or 0)
+        stats.gen_time_s = float(row.gen_time_s or 0)
+        stats.peak_prompt_tps = float(row.peak_prompt_tps or 0)
+        stats.peak_gen_tps = float(row.peak_gen_tps or 0)
+        stats.context_max = int(row.context_max or 0)
+        stats.mtp_proposed = float(row.mtp_proposed or 0)
+        stats.mtp_accepted = float(row.mtp_accepted or 0)
+        return stats
+
     def _unload_model(self, s: Session, provider: Provider, entry: dict,
                       st_m: ProviderState, ts_ms: int):
         """Model went from loaded to unloaded: close session, emit UNLOADED."""
-        if st_m.active_session_id:
+        if st_m.live_tasks:
+            self._end_live_tasks(s, st_m, ts_ms, "INCOMPLETE")
+        elif st_m.active_session_id:
             self._close_session(s, st_m, ts_ms)
         model = s.exec(select(Model).where(
             Model.provider_id == provider.id, Model.key == entry["key"])).first()
@@ -630,6 +894,28 @@ class Collector:
         st_m.was_loaded = False
         st_m.metrics_fail = 0
         st_m.mtp_window = []
+        st_m.live_tasks.clear()
+        st_m.slots_available = None
+
+    def _end_live_tasks(self, s: Session, st: ProviderState, end_ts_ms: int,
+                        status: str):
+        """End every slot-backed request without turning provisional values into totals."""
+        for task in list(st.live_tasks.values()):
+            row = s.get(SessionRow, task.session_id)
+            if row is None or row.status in ("CLOSED", "INCOMPLETE", "INTERRUPTED"):
+                continue
+            row.status = status
+            row.result_source = "incomplete" if status == "INCOMPLETE" else "interrupted"
+            row.end_at = min(end_ts_ms, int(task.last_seen * 1000))
+            row.duration_s = max(0.0, (row.end_at - row.start_at) / 1000.0)
+            s.add(row)
+        st.live_tasks.clear()
+        st.active_session_id = None
+        st.stats = None
+        st.last_activity_ts = None
+        st.prompt_phase_start_ts = None
+        st.first_gen_ts = None
+        s.commit()
 
     def _store_router_props(self, s: Session, provider: Provider, props: dict):
         """Nautilus router-level /props: persist build_info as a BuildInfo row."""
@@ -797,6 +1083,11 @@ class Collector:
         if sess.gen_time_s and sess.gen_tokens and sess.avg_gen_tps is None:
             sess.avg_gen_tps = sess.gen_tokens / sess.gen_time_s
         sess.status = "CLOSED"
+        sess.result_source = sess.result_source or "metrics"
+        sess.live_prompt_tokens = None
+        sess.live_gen_tokens = None
+        sess.live_context = None
+        sess.live_gen_tps = None
         st.active_session_id = None
         st.stats = None
         st.last_activity_ts = None

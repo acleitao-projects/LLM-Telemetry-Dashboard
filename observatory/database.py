@@ -10,7 +10,7 @@ from sqlalchemy.engine import Engine
 
 from . import models  # noqa: F401  (register tables)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _engine: Engine | None = None
 _db_path: str | None = None
@@ -109,6 +109,42 @@ def _migrate(engine: Engine) -> None:
                 _repair_retained_session_speeds(s, text)
                 s.exec(text(
                     "UPDATE meta SET value = '3' WHERE key = 'schema_version'"
+                ))
+                s.commit()
+                version = 3
+            if version < 4:
+                columns = {row[1] for row in s.exec(text(
+                    "PRAGMA table_info(session)"
+                )).all()}
+                additions = {
+                    "source_slot_id": "INTEGER",
+                    "source_task_id": "INTEGER",
+                    "live_prompt_tokens": "FLOAT",
+                    "live_gen_tokens": "FLOAT",
+                    "live_context": "INTEGER",
+                    "live_gen_tps": "FLOAT",
+                    "live_seen_at": "INTEGER",
+                    "result_source": "VARCHAR",
+                }
+                for name, sql_type in additions.items():
+                    if name not in columns:
+                        s.exec(text(
+                            f'ALTER TABLE session ADD COLUMN "{name}" {sql_type}'
+                        ))
+                s.exec(text(
+                    "CREATE INDEX IF NOT EXISTS ix_session_source_slot_id "
+                    "ON session (source_slot_id)"
+                ))
+                s.exec(text(
+                    "CREATE INDEX IF NOT EXISTS ix_session_source_task_id "
+                    "ON session (source_task_id)"
+                ))
+                s.exec(text(
+                    "CREATE INDEX IF NOT EXISTS ix_session_live_seen_at "
+                    "ON session (live_seen_at)"
+                ))
+                s.exec(text(
+                    "UPDATE meta SET value = '4' WHERE key = 'schema_version'"
                 ))
                 s.commit()
             if version > SCHEMA_VERSION:

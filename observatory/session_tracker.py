@@ -38,6 +38,21 @@ class SessionStats:
 
 
 @dataclass
+class LiveTaskState:
+    """Ephemeral state for one llama.cpp slot task."""
+    slot_id: int
+    task_id: int
+    session_id: int
+    first_seen: float
+    last_seen: float
+    prompt_tokens: float = 0.0
+    gen_tokens: float = 0.0
+    context: Optional[int] = None
+    speed_points: list[tuple[float, float]] = field(default_factory=list)
+    finalizing_since: Optional[float] = None
+
+
+@dataclass
 class ProviderState:
     """Collector state for one (provider, model) pair across polls."""
     last_ts: Optional[float] = None
@@ -57,6 +72,8 @@ class ProviderState:
     metrics_fail: int = 0
     fail_streak: int = 0
     epoch: int = 0
+    live_tasks: dict[str, LiveTaskState] = field(default_factory=dict)
+    slots_available: Optional[bool] = None
 
 
 def detect_state(health_status: Optional[str], d_prompt: float, d_gen: float,

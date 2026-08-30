@@ -354,6 +354,7 @@ function initModels(meta) {
       if (!s || !s.label) { box.innerHTML = '<div class="empty">no data for selection</div>'; return; }
       const pt = s.prompt_tokens || 0, gt = s.gen_tokens || 0, tot = (pt + gt) || 1;
       const hasMtp = s.mtp_proposed != null && s.mtp_proposed > 0;
+      const live = s.live && !s.live.tasks ? s.live : (s.live && s.live.tasks ? s.live.tasks[0] : null);
       box.innerHTML =
         '<div class="sel-head"><span class="m-dot" style="background:' + esc(s.color) + '"></span>' +
         '<span class="tag">SELECTED</span><span class="sel-name">' + esc(s.label) + "</span></div>" +
@@ -363,8 +364,10 @@ function initModels(meta) {
         selMetric("GENERATED", s.generated_pct != null ? s.generated_pct + "%" : "—", fmtTokens(gt) + " generated") +
         selMetric("SESSIONS", s.sessions != null ? s.sessions : "—",
           s.per_session != null ? fmtTokens(s.per_session) + " tokens each" : "") +
-        selMetric("PEAK GEN", s.peak_gen != null ? s.peak_gen + " t/s" : "—",
-          s.gen_tps != null ? "avg " + s.gen_tps + " t/s" : "") +
+        selMetric(live ? "LIVE GEN" : "PEAK GEN", live ? fmtTokens(live.gen_tokens) :
+          (s.peak_gen != null ? s.peak_gen + " t/s" : "—"), live ?
+          ((live.gen_tps != null ? live.gen_tps + " t/s · " : "") + "provisional") :
+          (s.gen_tps != null ? "avg " + s.gen_tps + " t/s" : "")) +
         selMetric("PEAK PROMPT", s.peak_prompt != null ? s.peak_prompt + " t/s" : "—", fmtTokens(pt) + " prompt") +
         selMetric("PROMPT SHARE", pt ? Math.round(pt / (pt + gt) * 100) + "%" : "—", "of group tokens") +
         selMetric("MTP ACCEPTANCE", hasMtp && s.mtp_acc != null ? s.mtp_acc + "%" : "No activity",
@@ -462,7 +465,9 @@ function initModelDetail(meta) {
 
   const render = (d) => {
     if (!d || !d.model) return;
+    ch.clear();
     const m = d.model;
+    const live = m.live && !m.live.tasks ? m.live : (m.live && m.live.tasks ? m.live.tasks[0] : null);
     el("mdlHead").innerHTML =
       '<span class="m-dot" style="background:' + esc(m.color) + ';width:10px;height:10px"></span>' +
       '<span style="font-size:14px;font-weight:600">' + esc(m.name) + "</span>" +
@@ -478,8 +483,10 @@ function initModelDetail(meta) {
         fmtTokens(d.tokens.prompt) + " prompt · " + fmtTokens(d.tokens.generated) + " gen", null) +
       metricCard("INFERENCE", fmtDur(d.accounting.inference_s),
         d.accounting.utilization != null ? d.accounting.utilization + "% of loaded time" : "", null) +
-      metricCard("AVG GEN", d.speeds.avg_gen_tps != null ? d.speeds.avg_gen_tps + " t/s" : "—",
-        d.speeds.peak_gen_tps ? "peak " + d.speeds.peak_gen_tps + " t/s" : "", null) +
+      metricCard(live ? "LIVE GEN" : "AVG GEN", live ? fmtTokens(live.gen_tokens) :
+        (d.speeds.avg_gen_tps != null ? d.speeds.avg_gen_tps + " t/s" : "—"),
+        live ? ((live.gen_tps != null ? live.gen_tps + " t/s · " : "") + "provisional") :
+        (d.speeds.peak_gen_tps ? "peak " + d.speeds.peak_gen_tps + " t/s" : ""), null) +
       metricCard("AVG PROMPT", d.speeds.avg_prompt_tps != null ? d.speeds.avg_prompt_tps + " t/s" : "—",
         d.speeds.peak_prompt_tps ? "peak " + d.speeds.peak_prompt_tps + " t/s" : "", null) +
       metricCard("MTP ACCEPT", d.mtp_acc != null ? d.mtp_acc + "%" : "—",
@@ -535,6 +542,7 @@ function initModelDetail(meta) {
 
   segControl("mdlRange", DETAIL_RANGES, "24h", (r) => { st.range = r; load().then(render); });
   load().then(render);
+  window.__onLive = () => load().then(render).catch(() => {});
 }
 
 /* ------------------------------------------------------------------ sessions */
@@ -581,20 +589,31 @@ function initSessions(meta) {
       return;
     }
     tb.innerHTML = d.sessions.map((x) =>
-      '<tr class="clickable" data-id="' + x.id + '">' +
+      (() => {
+      const live = x.live || null;
+      const promptTokens = live ? live.prompt_tokens : x.prompt_tokens;
+      const genTokens = live ? live.gen_tokens : x.gen_tokens;
+      const genTps = live && live.gen_tps != null ? live.gen_tps : x.avg_gen_tps;
+      const duration = live ? Math.max(0, (d.now - x.start) / 1000) : x.duration_s;
+      const status = x.status === "ACTIVE" ? '<span class="badge badge-demo">LIVE</span>' :
+        x.status === "FINALIZING" ? '<span class="badge">FINALIZING</span>' :
+        x.status === "INTERRUPTED" ? '<span class="muted">interrupted</span>' :
+        x.status === "INCOMPLETE" ? '<span class="muted">incomplete</span>' : '<span class="muted">closed</span>';
+      return '<tr class="clickable" data-id="' + x.id + '">' +
       "<td>" + fmtDate(x.start) + '</td><td class="muted">' + fmtAgo(x.start, d.now) + "</td>" +
       '<td><span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span> ' + esc(x.model || "—") + "</td>" +
       '<td class="muted">' + esc(x.provider || "") + "</td>" +
       "<td>" + (x.quant ? '<span class="badge">' + esc(x.quant) + "</span>" : "—") + "</td>" +
-      '<td class="num">' + fmtDur(x.duration_s) + "</td>" +
-      '<td class="num">' + fmtTokens(x.prompt_tokens) + "</td>" +
-      '<td class="num">' + fmtTokens(x.gen_tokens) + "</td>" +
+      '<td class="num">' + fmtDur(duration) + "</td>" +
+      '<td class="num">' + fmtTokens(promptTokens) + (live ? ' <span class="muted">live</span>' : '') + "</td>" +
+      '<td class="num">' + fmtTokens(genTokens) + (live ? ' <span class="muted">live</span>' : '') + "</td>" +
       '<td class="num">' + (x.prompt_tps != null ? x.prompt_tps : "—") + "</td>" +
-      '<td class="num">' + (x.avg_gen_tps != null ? x.avg_gen_tps : "—") + "</td>" +
+      '<td class="num">' + (genTps != null ? genTps : "—") + (live ? ' <span class="muted">live</span>' : '') + "</td>" +
       '<td class="num">' + (x.mtp_acc != null ? x.mtp_acc + "%" :
         (x.mtp_enabled == null ? "—" : x.mtp_enabled ? "on" : "off")) + "</td>" +
-      '<td>' + (x.status === "ACTIVE" ? '<span class="badge badge-demo">ACTIVE</span>' : '<span class="muted">closed</span>') + "</td>" +
-      "</tr>").join("");
+      '<td>' + status + "</td>" +
+      "</tr>";
+      })()).join("");
     tb.querySelectorAll("tr.clickable").forEach((tr) => {
       tr.onclick = () => { location.href = "/session/" + tr.dataset.id; };
     });
@@ -610,6 +629,7 @@ function initSessions(meta) {
   });
   segControl("sessMtp", ["any", "on", "off"], "any", (v) => { st.mtp = v; reload(); });
   reload();
+  window.setInterval(reload, 2000);
   return Promise.resolve();
 }
 
@@ -620,6 +640,8 @@ function initSessionDetail(meta) {
   return api("/api/session/" + sid).then((d) => {
     if (!d || !d.session) return;
     const s = d.session;
+    const live = s.live || null;
+    const displayDuration = live ? Math.max(0, (d.now - s.start) / 1000) : s.duration_s;
     el("sdHead").innerHTML =
       '<div class="kv-inline"><span class="l">MODEL</span><span class="v"><span class="m-dot" style="background:' +
       esc(s.color || "#74736e") + '"></span> ' +
@@ -628,21 +650,24 @@ function initSessionDetail(meta) {
       '<div class="kv-inline"><span class="l">QUANT</span><span class="v">' + (s.quant ? esc(s.quant) : "—") + "</span></div>" +
       '<div class="kv-inline"><span class="l">PROVIDER</span><span class="v">' + esc(s.provider || "—") + "</span></div>" +
       '<div class="kv-inline"><span class="l">STARTED</span><span class="v">' + fmtDate(s.start) + "</span></div>" +
-      '<div class="kv-inline"><span class="l">DURATION</span><span class="v">' + fmtDur(s.duration_s) + "</span></div>" +
+      '<div class="kv-inline"><span class="l">DURATION</span><span class="v">' + fmtDur(displayDuration) + "</span></div>" +
       '<div class="kv-inline"><span class="l">STATUS</span><span class="v">' +
-      (s.status === "ACTIVE" ? '<span class="badge badge-demo">ACTIVE</span>' : "closed") + "</span></div>";
+      (s.status === "ACTIVE" ? '<span class="badge badge-demo">LIVE</span>' :
+        s.status === "FINALIZING" ? '<span class="badge">FINALIZING</span>' : esc((s.status || "closed").toLowerCase())) + "</span></div>";
 
     el("sdCards").innerHTML =
-      metricCard("PROMPT TOK", fmtTokens(s.prompt_tokens),
+      metricCard("PROMPT TOK", fmtTokens(live ? live.prompt_tokens : s.prompt_tokens),
         s.prompt_tps != null ? s.prompt_tps + " t/s · " + fmtDur(s.prompt_time_s) : fmtDur(s.prompt_time_s), null) +
-      metricCard("GEN TOK", fmtTokens(s.gen_tokens),
-        (s.avg_gen_tps != null ? "avg " + s.avg_gen_tps + " t/s · " : "") + fmtDur(s.gen_time_s), null) +
+      metricCard("GEN TOK", fmtTokens(live ? live.gen_tokens : s.gen_tokens),
+        (live ? "live " + (live.gen_tps != null ? live.gen_tps + " t/s" : "in progress") :
+          (s.avg_gen_tps != null ? "avg " + s.avg_gen_tps + " t/s · " : "") + fmtDur(s.gen_time_s)), null) +
       metricCard("TTFT", s.ttft_s != null ? s.ttft_s + "s" : "—",
         s.peak_gen_tps ? "peak gen " + s.peak_gen_tps + " t/s" : "", null) +
       metricCard("MTP", s.mtp_acc != null ? s.mtp_acc + "%" :
         (s.mtp_enabled == null ? "—" : s.mtp_enabled ? "on" : "off"),
         s.mtp_proposed ? s.mtp_proposed + " proposed · " + s.mtp_accepted + " accepted" : "", null) +
-      metricCard("CONTEXT", s.context_max ? fmtNum(s.context_max) : "—", "peak used in session", null) +
+      metricCard("CONTEXT", live && live.context ? fmtNum(live.context) : (s.context_max ? fmtNum(s.context_max) : "—"),
+        live ? "live · provisional" : "peak used in session", null) +
       metricCard("HARDWARE", (s.gpus || []).length ? (s.gpus.length + " GPUs") :
         (s.gpu_util_avg != null ? s.gpu_util_avg + "%" : "—"),
         (s.gpus || []).length ? "per-GPU host activity" :
@@ -672,128 +697,93 @@ function initSessionDetail(meta) {
 
 /* ------------------------------------------------------------------- compare */
 function initCompare(meta) {
-  let sel = [];
-  let cands = [];
-
-  const CMP_ROWS = [
-    ["model", "Model", (x) => x.model, null],
-    ["quant", "Quant", (x) => x.quant, null],
-    ["provider", "Provider", (x) => x.provider, null],
-    ["start", "Started", (x) => fmtDate(x.start), null],
-    ["duration", "Duration", (x) => fmtDur(x.duration_s), null],
-    ["prompt_tokens", "Prompt tok", (x) => fmtTokens(x.prompt_tokens), "max"],
-    ["gen_tokens", "Gen tok", (x) => fmtTokens(x.gen_tokens), "max"],
-    ["prompt_tps", "Prompt t/s", (x) => x.prompt_tps, "max"],
-    ["avg_gen_tps", "Avg gen t/s", (x) => x.avg_gen_tps, "max"],
-    ["peak_gen_tps", "Peak gen t/s", (x) => x.peak_gen_tps, "max"],
-    ["context_max", "Context max", (x) => (x.context_max ? fmtNum(x.context_max) : null), "max"],
-    ["mtp", "MTP", (x) => (x.mtp_enabled == null ? "—" : x.mtp_enabled ? "on" : "off"), null],
-    ["mtp_acc", "MTP acc %", (x) => x.mtp_acc, "max"],
-    ["kv_cache", "KV cache", (x) => x.kv_cache || "—", null],
-    ["split_mode", "Split", (x) => x.split_mode || "—", null],
-    ["reasoning_effort", "Reasoning", (x) => x.reasoning_effort || "—", null],
-    ["gpus", "Per-GPU averages", (x) => (x.gpus || []).map((g) =>
-      "GPU " + g.index + ": " + (g.summary.util != null ? g.summary.util + "%" : "—") +
-      " / " + (g.summary.vram_mb != null ? fmtBytes(g.summary.vram_mb * 1024 * 1024) : "—")).join(" · ") || "—", null],
-    ["build", "Build", (x) => x.build || "—", null],
+  const providers = (meta && meta.providers) || [];
+  const st = { range: "7d", provider: "", selected: [], candidates: [] };
+  const rows = [
+    ["Variants", (x) => (x.variants || []).join(" · ") || "—"],
+    ["Quants", (x) => (x.quants || []).join(" · ") || "—"],
+    ["Providers", (x) => (x.providers || []).join(" · ") || "—"],
+    ["Total tokens", (x) => fmtTokens(x.tokens)],
+    ["Prompt tokens", (x) => fmtTokens(x.prompt_tokens)],
+    ["Generated tokens", (x) => fmtTokens(x.gen_tokens)],
+    ["Avg prompt t/s", (x) => x.prompt_tps, "max"],
+    ["Peak prompt t/s", (x) => x.peak_prompt_tps, "max"],
+    ["Avg gen t/s", (x) => x.avg_gen_tps, "max"],
+    ["Peak gen t/s", (x) => x.peak_gen_tps, "max"],
+    ["Inference time", (x) => fmtDur(x.inference_s)],
+    ["Loaded / idle", (x) => fmtDur(x.loaded_s) + " / " + fmtDur(x.idle_s)],
+    ["Utilization", (x) => x.utilization != null ? x.utilization + "%" : "—", "max"],
+    ["Context max", (x) => x.context_max ? fmtNum(x.context_max) : "—"],
+    ["MTP acceptance", (x) => x.mtp_acc != null ? x.mtp_acc + "%" : "—", "max"],
+    ["MTP drafts", (x) => x.mtp_proposed ? fmtTokens(x.mtp_accepted) + " accepted / " + fmtTokens(x.mtp_rejected) + " rejected" : "—"],
+    ["Configuration", (x) => x.configuration || "—"],
+    ["KV cache", (x) => x.kv_cache || "—"],
+    ["Split / reasoning", (x) => (x.split_mode || "—") + " / " + (x.reasoning_effort || "—")],
+    ["Per-GPU averages", (x) => (x.gpus || []).map((g) => "GPU " + g.index + ": " +
+      (g.summary.util != null ? g.summary.util + "%" : "—") + " / " +
+      (g.summary.vram_mb != null ? fmtBytes(g.summary.vram_mb * 1024 * 1024) : "—")).join(" · ") || "—"],
+    ["Build", (x) => x.build || "—"],
   ];
 
+  const query = (path, includeKeys) => {
+    const q = new URLSearchParams({ range: st.range });
+    if (st.provider) q.set("provider", st.provider);
+    if (includeKeys) q.set("keys", st.selected.join("|"));
+    return path + "?" + q.toString();
+  };
   const renderPick = () => {
-    const box = el("cmpPick");
-    el("cmpCount").textContent = sel.length + " / 5 selected";
-    if (!cands.length) { box.innerHTML = '<div class="empty">no sessions observed yet</div>'; return; }
-    box.innerHTML = cands.map((x) =>
-      '<label class="cmp-row"><input type="checkbox" data-id="' + x.id + '"' +
-      (sel.includes(x.id) ? " checked" : "") + ">" +
-      '<span class="t">' + fmtDate(x.start) + "</span>" +
+    el("cmpCount").textContent = st.selected.length + " / 5 selected";
+    el("cmpPick").innerHTML = st.candidates.length ? st.candidates.map((x, i) =>
+      '<label class="cmp-row"><input type="checkbox" data-idx="' + i + '"' +
+      (st.selected.includes(x.key) ? " checked" : "") + ">" +
       '<span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span>' +
-      "<span>" + esc(x.model || "—") + "</span>" +
-      '<span class="muted" style="margin-left:auto">' + fmtTokens(x.gen_tokens) +
-      (x.mtp_enabled ? " · MTP" : "") + "</span></label>").join("");
-    box.querySelectorAll("input").forEach((inp) => {
-      inp.onchange = () => {
-        const id = Number(inp.dataset.id);
-        if (inp.checked) {
-          if (sel.length >= 5) { inp.checked = false; return; }
-          sel.push(id);
-        } else sel = sel.filter((x) => x !== id);
-        renderPick();
-        loadCmp();
+      '<span>' + esc(x.label) + '</span><span class="muted" style="margin-left:auto">' +
+      (x.gen_tps != null ? x.gen_tps + " t/s" : fmtTokens(x.tokens)) + "</span></label>").join("") :
+      '<div class="empty">no model-family activity in this range</div>';
+    el("cmpPick").querySelectorAll("input").forEach((input) => {
+      input.onchange = () => {
+        const key = st.candidates[Number(input.dataset.idx)].key;
+        if (input.checked) {
+          if (st.selected.length >= 5) { input.checked = false; return; }
+          st.selected.push(key);
+        } else st.selected = st.selected.filter((value) => value !== key);
+        renderPick(); loadCompare();
       };
     });
   };
-
-  const fmtDelta = (kind, v) => {
-    if (v == null) return "—";
-    if (kind === "dur") return fmtDur(v);
-    if (kind === "tok") return fmtTokens(v);
-    return Number(v).toFixed(1);
-  };
-
-  const renderDeltas = (ss) => {
-    const panel = el("cmpDeltaPanel");
-    if (ss.length < 2) { panel.hidden = true; return; }
-    panel.hidden = false;
-    const out = [];
-    for (let i = 1; i < ss.length; i++) {
-      const a = ss[i - 1], b = ss[i];
-      const items = [
-        ["gen t/s", a.avg_gen_tps, b.avg_gen_tps, "num"],
-        ["prompt t/s", a.prompt_tps, b.prompt_tps, "num"],
-        ["duration", a.duration_s, b.duration_s, "dur"],
-        ["gen tok", a.gen_tokens, b.gen_tokens, "tok"],
-      ];
-      if (a.mtp_acc != null || b.mtp_acc != null) items.push(["mtp acc", a.mtp_acc, b.mtp_acc, "num"]);
-      const parts = items.map(([l, va, vb, kind]) => {
-        if (va == null || vb == null) return '<span class="muted">' + l + ": —</span>";
-        const good = vb >= va;
-        return '<span class="' + (good ? "cmp-delta-up" : "cmp-delta-down") + '">' + l + ": " +
-          fmtDelta(kind, va) + " → " + fmtDelta(kind, vb) + "</span>";
-      });
-      out.push('<div style="display:flex;gap:14px;padding:7px 0;border-top:1px solid #232320;flex-wrap:wrap;align-items:center">' +
-        '<span class="arrow-cmp"><span class="from">' + esc(a.model || "—") + "</span> → <span class=\"to\">" +
-        esc(b.model || "—") + "</span></span>" + parts.join("") + "</div>");
-    }
-    el("cmpDeltas").innerHTML = out.join("");
-  };
-
-  const loadCmp = () => {
-    const panel = el("cmpTable");
+  const loadCompare = () => {
     el("cmpDeltaPanel").hidden = true;
-    if (sel.length < 2) {
-      panel.innerHTML = sel.length === 1
-        ? '<div class="empty">select at least one more session to compare</div>'
-        : '<div class="empty">pick up to five sessions on the left — nothing is executed, observed sessions only</div>';
+    if (st.selected.length < 2) {
+      el("cmpTable").innerHTML = '<div class="empty">select at least two model families to compare</div>';
       return;
     }
-    api("/api/compare?ids=" + sel.join(",")).then((d) => {
-      const ss = d.sessions;
-      let html = '<table class="data-table"><tr><th style="width:120px"></th>' + ss.map((x) =>
-        '<th><span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span> ' +
-        esc(x.model || ("#" + x.id)) + "</th>").join("") + "</tr>";
-      for (const [key, label, get, mode] of CMP_ROWS) {
-        const vals = ss.map(get);
-        let best = -1;
-        if (mode === "max") {
-          let mv = null;
-          vals.forEach((v, i) => {
-            if (typeof v === "number" && (mv == null || v > mv)) { mv = v; best = i; }
-          });
-          if (mv == null) best = -1;
-        }
-        html += '<tr><td class="muted">' + label + "</td>" + vals.map((v, i) =>
-          '<td class="num' + (i === best ? " diff-hl" : "") + '">' + (v == null ? "—" : esc(v)) + "</td>").join("") + "</tr>";
-      }
-      html += "</table>";
-      panel.innerHTML = html;
-      renderDeltas(ss);
+    api(query("/api/compare/models", true)).then((data) => {
+      const models = data.models || [];
+      let html = '<table class="data-table"><tr><th style="width:150px"></th>' + models.map((x) =>
+        '<th><span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span> ' + esc(x.model) + "</th>").join("") + "</tr>";
+      rows.forEach(([label, get, mode]) => {
+        const values = models.map(get); let best = -1, max = null;
+        if (mode === "max") values.forEach((value, i) => {
+          const n = parseFloat(value); if (Number.isFinite(n) && (max == null || n > max)) { max = n; best = i; }
+        });
+        html += '<tr><td class="muted">' + label + "</td>" + values.map((value, i) =>
+          '<td class="num' + (i === best ? " diff-hl" : "") + '">' + esc(value == null ? "—" : value) + "</td>").join("") + "</tr>";
+      });
+      el("cmpTable").innerHTML = html + "</table>";
     });
   };
-
-  api("/api/compare/candidates").then((d) => {
-    cands = d.sessions || [];
-    renderPick();
+  const loadCandidates = () => api(query("/api/compare/models/candidates", false)).then((data) => {
+    st.candidates = data.models || [];
+    const available = new Set(st.candidates.map((x) => x.key));
+    st.selected = st.selected.filter((key) => available.has(key));
+    renderPick(); loadCompare();
   });
+  fillSelect(el("cmpProvider"), "All providers", providers.map((p) => [p.id, p.name]), st.provider);
+  el("cmpProvider").onchange = (event) => { st.provider = event.target.value; loadCandidates(); };
+  segControl("cmpRange", RANGES.map((r) => RANGE_LABELS[r]), RANGE_LABELS[st.range], (label) => {
+    st.range = RANGES.find((r) => RANGE_LABELS[r] === label) || "7d"; loadCandidates();
+  });
+  loadCandidates();
   return Promise.resolve();
 }
 
@@ -937,18 +927,21 @@ function initSettings(meta) {
       const t = p.telemetry || {};
       const groups = ["counters", "speeds", "context", "mtp", "gpu"].map((g) =>
         '<span class="badge" style="margin-right:4px">' + g + (t[g] ? " ✓" : " ✗") + "</span>").join("");
+      const slots = p.endpoints && p.endpoints.slots;
+      const endpointBadge = '<span class="badge" style="margin-right:4px">slots ' +
+        (slots === true ? "✓" : slots === false ? "✗" : "?") + "</span>";
       return "<tr>" +
         "<td>" + pillHtml(p.status) + " <b>" + esc(p.name) + "</b></td>" +
         '<td class="muted">' + esc(p.url) + "</td>" +
         '<td class="num">' + (p.latency_ms != null ? p.latency_ms + " ms" : "—") + "</td>" +
         "<td>" + esc(p.last_success_ago) + "</td>" +
         '<td class="muted">' + (p.agent_status || "—") + "</td>" +
-        "<td>" + groups + "</td>" +
+        "<td>" + endpointBadge + groups + "</td>" +
         '<td class="muted">' + esc(p.build || "—") + "</td>" +
         "</tr>";
     }).join("");
-    el("sysMeta").textContent = "db " + fmtBytes(st.db_size_bytes) + " · " + st.db_path +
-      " · uptime " + fmtDur(st.uptime_s);
+    el("sysMeta").textContent = "collector " + ((st.collector && st.collector.role) || "unknown") +
+      " · db " + fmtBytes(st.db_size_bytes) + " · " + st.db_path + " · uptime " + fmtDur(st.uptime_s);
     const errP = st.providers.find((p) => p.last_error);
     el("sysErr").textContent = errP ? "last error (" + errP.name + "): " + errP.last_error : "";
   };
@@ -996,7 +989,7 @@ function initSettings(meta) {
               .then((r) => r.json()).then((t) => {
                 if (t.ok) {
                   const n = Object.values(t.endpoints).filter(Boolean).length;
-                  msg.textContent = "OK · " + n + "/4 endpoints · model " + (t.model || "?") +
+                  msg.textContent = "OK · " + n + "/" + Object.keys(t.endpoints).length + " endpoints · model " + (t.model || "?") +
                     " · " + t.latency_ms + " ms";
                 } else msg.textContent = "FAIL · " + (t.error || "no /health endpoint");
               }).catch((e) => { msg.textContent = "error: " + e; });

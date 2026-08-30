@@ -111,7 +111,7 @@ def create_app(demo: bool = False) -> FastAPI:
     def compare_page(request: Request):
         return templates.TemplateResponse(request, "base.html", {
             "page": "compare", "title": "Compare",
-            "subtitle": "Compare up to five observed sessions. Nothing is executed.",
+            "subtitle": "Compare observed model families across the same time range.",
             "nav": NAV, "demo": demo, "query": {}, "template": "compare.html",
         })
 
@@ -190,6 +190,20 @@ def create_app(demo: bool = False) -> FastAPI:
         with odb.new_session() as s:
             return {"sessions": m.compare_candidates(s)}
 
+    @app.get("/api/compare/models/candidates")
+    def api_compare_model_candidates(provider: Optional[int] = None,
+                                     range: str = "7d"):
+        with odb.new_session() as s:
+            return {"models": m.compare_model_candidates(s, provider, range),
+                    "range": range}
+
+    @app.get("/api/compare/models")
+    def api_compare_models(keys: str = "", provider: Optional[int] = None,
+                           range: str = "7d"):
+        family_keys = [x for x in keys.split("|") if x]
+        with odb.new_session() as s:
+            return m.compare_models(s, family_keys, provider, range)
+
     @app.get("/api/hardware")
     def api_hardware(provider: Optional[int] = None):
         with odb.new_session() as s:
@@ -198,7 +212,14 @@ def create_app(demo: bool = False) -> FastAPI:
     @app.get("/api/status")
     def api_status():
         with odb.new_session() as s:
-            return m.status(s)
+            data = m.status(s)
+        collector = app.state.collector
+        data["collector"] = (collector.lease_status() if collector else
+                             {"role": "disabled", "owner_id": None})
+        endpoints = collector.endpoint_status() if collector else {}
+        for provider in data.get("providers", []):
+            provider["endpoints"] = endpoints.get(provider.get("id"), {})
+        return data
 
     @app.get("/api/stream")
     async def api_stream():
@@ -295,6 +316,12 @@ def create_app(demo: bool = False) -> FastAPI:
                     row.value = json.dumps(data[k])
             s.commit()
             return {"display": _display_settings(s)}
+
+    @app.on_event("shutdown")
+    def shutdown_collector():
+        collector = app.state.collector
+        if collector is not None:
+            collector.stop()
 
     return app
 
@@ -393,6 +420,13 @@ def _test_provider(p: Provider) -> dict:
             out["endpoints"]["metrics"] = True
         except Exception:
             out["endpoints"]["metrics"] = False
+        if model_id:
+            try:
+                r5 = httpx.get(base + "/slots", params={"model": model_id}, timeout=5.0)
+                r5.raise_for_status()
+                out["endpoints"]["slots"] = isinstance(r5.json(), list)
+            except Exception:
+                out["endpoints"]["slots"] = False
         try:
             r3 = httpx.get(base + "/props", timeout=5.0)
             r3.raise_for_status()

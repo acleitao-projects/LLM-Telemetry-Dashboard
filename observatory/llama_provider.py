@@ -5,6 +5,7 @@ Observatory NEVER sends prompts. The only endpoints ever touched are:
     GET /metrics
     GET /props
     GET /v1/models
+    GET /slots
 """
 from __future__ import annotations
 
@@ -105,6 +106,17 @@ class LlamaClient:
             return data.get("data", []) or []
         return data or []
 
+    def slots(self, model: Optional[str] = None) -> list[dict]:
+        """Live per-slot state; Nautilus requires the model query parameter."""
+        url = self.base_url + "/slots"
+        if model:
+            url += "?model=" + urllib.parse.quote(model)
+        r = self._c.get(url)
+        r.raise_for_status()
+        self.available["slots"] = True
+        data = r.json()
+        return data if isinstance(data, list) else []
+
     def close(self):
         try:
             self._c.close()
@@ -148,7 +160,8 @@ class FakeClient:
         self._fn = snapshot_fn
         self._last: dict = {}
         self.base_url = "demo://nautilus"
-        self.available = {"health": True, "metrics": True, "props": True, "models": True}
+        self.available = {"health": True, "metrics": True, "props": True,
+                          "models": True, "slots": True}
 
     def _snap(self) -> dict:
         self._last = self._fn()
@@ -165,6 +178,9 @@ class FakeClient:
 
     def models(self) -> list[dict]:
         return self._snap().get("models", [])
+
+    def slots(self, model: Optional[str] = None) -> list[dict]:
+        return self._snap().get("slots", [])
 
     def agent_snapshot(self) -> dict:
         self._snap()

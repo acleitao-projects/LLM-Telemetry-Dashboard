@@ -7,7 +7,7 @@ how they were launched, how MTP behaved, and what the hardware was doing.
 
 **Hard rule:** LLM-Telemetry never sends prompts, never triggers inference,
 never loads/unloads models, never restarts anything. It only reads the
-read-only endpoints `/health`, `/metrics`, `/props`, `/v1/models` of a
+read-only endpoints `/health`, `/metrics`, `/props`, `/v1/models`, and `/slots` of a
 llama.cpp server, and (optionally) `/info`, `/gpu`, `/llama` of the
 passive host agent.
 
@@ -55,13 +55,14 @@ verify the whole pipeline end to end.
   with a **Full launch flags** dump and **config history** (every distinct
   launch config observed, kept forever).
 - **Sessions** — externally driven inference sessions detected passively from
-  token counters (a session ends after 8 s without activity). Filter by
+  llama.cpp slot/task identity, with explicitly provisional live progress and
+  authoritative completed totals from `/metrics`. Filter by
   provider, model, quant, MTP on/off, reasoning effort, range.
 - **Session detail** — TTFT, prompt/gen tokens and speeds, peaks, context
   peak, MTP acceptance, hardware averages, per-second series, the launch
   config that session ran with.
-- **Compare** — line up to five *observed* sessions side by side (best per row
-  highlighted, deltas in selection order). Nothing is executed.
+- **Compare** — line up to five observed model families side by side across a
+  shared range. Files and quants are aggregated; nothing is executed.
 - **Hardware** — host (CPU/RAM/GPU/driver/PCIe), authoritative llama.cpp build
   version/commit from `/props`, and 1 h per-GPU utilization, VRAM, temperature
   and power series alongside CPU/RAM. Requires the host agent for host metrics.
@@ -78,10 +79,13 @@ verify the whole pipeline end to end.
 - Runtime states: `UNLOADED / LOADING / IDLE / PROMPTING / GENERATING`.
   **Inference time = prompting + generation**; IDLE time is loaded-but-idle
   and is never counted as inference. **Model utilization = inference / loaded**.
-- Sessions start when token counters move, carry the launch config that was
+- Sessions start when `/slots` reports a processing task, carry the launch config that was
   active at the time, and record TTFT (first generated delta after a prompt
   phase), per-session MTP proposed/accepted, context peak, and hardware
-  averages.
+  averages. Live slot counts are never added to completed metric totals.
+- A renewable SQLite lease permits only one collector per database. Additional
+  dashboard processes stay read-only and automatically take over if the active
+  collector lease becomes stale.
 - MTP acceptance = accepted / proposed × 100 over the range, from the
   server's cumulative MTP counters.
 

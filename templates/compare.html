@@ -1,7 +1,11 @@
 <div class="page-controls">
   <div class="muted" style="font-size:11px;max-width:640px">
-    Pick up to five already-observed sessions. Nothing is executed — compare only.
-    Best value per row is highlighted; deltas follow selection order.
+    Compare up to five observed model families. Files and quants in each family are aggregated
+    over the selected range; nothing is executed.
+  </div>
+  <div style="display:flex;gap:10px;align-items:flex-end">
+    <div class="field" style="width:160px;margin:0"><label>Provider</label><select id="cmpProvider"></select></div>
+    <div class="seg" id="cmpRange"></div>
   </div>
 </div>
 
@@ -12,7 +16,7 @@
   </div>
   <div>
     <div class="panel" id="cmpTablePanel">
-      <div id="cmpTable"><div class="empty">pick up to five sessions on the left — nothing is executed, observed sessions only</div></div>
+      <div id="cmpTable"><div class="empty">select at least two model families to compare</div></div>
     </div>
     <div class="panel" style="margin-top:12px" id="cmpDeltaPanel" hidden>
       <div class="panel-head"><b>Deltas</b><span class="muted">in selection order</span></div>

@@ -13,6 +13,52 @@ from sqlmodel import Session, select
 from . import database as db
 from .models import (BuildInfo, GpuTelemetrySample, HardwareInfo, Model,
                      ModelConfig, Provider, SessionRow, TelemetrySample, now_ms)
+
+LIVE_FRESH_MS = 10_000
+FINALIZING_FRESH_MS = 15_000
+
+
+def _effective_session_status(row: SessionRow, now: int) -> str:
+    if row.status == "ACTIVE":
+        if row.live_seen_at is None:
+            return "INTERRUPTED"
+        return "ACTIVE" if now - row.live_seen_at <= LIVE_FRESH_MS else "INTERRUPTED"
+    if row.status == "FINALIZING":
+        if row.live_seen_at is not None and now - row.live_seen_at <= FINALIZING_FRESH_MS:
+            return "FINALIZING"
+        return "INCOMPLETE"
+    return row.status
+
+
+def _session_live(row: Optional[SessionRow], now: int) -> Optional[dict]:
+    if row is None or _effective_session_status(row, now) not in ("ACTIVE", "FINALIZING"):
+        return None
+    return {
+        "processing": row.status == "ACTIVE",
+        "slot_id": row.source_slot_id,
+        "task_id": row.source_task_id,
+        "prompt_tokens": round(row.live_prompt_tokens or 0),
+        "gen_tokens": round(row.live_gen_tokens or 0),
+        "context": row.live_context,
+        "gen_tps": round(row.live_gen_tps, 1) if row.live_gen_tps is not None else None,
+        "observed_at": row.live_seen_at,
+        "provisional": True,
+    }
+
+
+def _model_live(s: Session, model_id: int, now: int) -> Optional[dict]:
+    rows = list(s.exec(select(SessionRow).where(
+        SessionRow.model_id == model_id,
+        SessionRow.status.in_(["ACTIVE", "FINALIZING"]),
+    ).order_by(SessionRow.live_seen_at.desc()).limit(8)).all())
+    live = [_session_live(row, now) for row in rows]
+    live = [item for item in live if item]
+    if not live:
+        return None
+    if len(live) == 1:
+        return live[0]
+    return {"processing": any(item["processing"] for item in live),
+            "tasks": live, "provisional": True}
 from .settings import (FAMILY_TAG_TOKENS, MODEL_COLORS, QUANT_TOKENS,
                        RANGE_BUCKETS, TELEMETRY_GROUPS)
 
@@ -482,6 +528,8 @@ def selected_stats(s: Session, model_ids: list[int], provider_id: Optional[int],
             spark[max(0, b)] += d
         prev = r
     m = models.get(model_ids[0])
+    live_items = [_model_live(s, model_id, now) for model_id in model_ids]
+    live_items = [item for item in live_items if item]
     return {
         "label": m.name if m else None,
         "color": m.color if m else "#4b8de8",
@@ -501,6 +549,8 @@ def selected_stats(s: Session, model_ids: list[int], provider_id: Optional[int],
         "mtp_acc": round(mtp_acc, 1) if mtp_acc is not None else None,
         "spark": [round(x) for x in spark],
         "provider": (s.get(Provider, m.provider_id).name if m else None),
+        "live": live_items[0] if len(live_items) == 1 else
+                ({"tasks": live_items, "provisional": True} if live_items else None),
     }
 
 
@@ -554,7 +604,12 @@ def overview(s: Session, provider_id: Optional[int] = None) -> dict:
             "session_elapsed_s": round(elapsed) if elapsed is not None else None,
             "tokens_total": r.tokens_total,
             "sample_age_s": round((now - r.ts) / 1000.0, 1) if r.ts else None,
+            "live": _session_live(sess, now),
         }
+        if current["live"]:
+            current["state"] = "GENERATING" if current["live"].get("gen_tokens", 0) > 0 else "PROMPTING"
+            current["gen_tps"] = current["live"].get("gen_tps")
+            current["context_used"] = current["live"].get("context")
 
     day_start = local_day_start_ms(now)
     prov_ids = [p.id for p in provs]
@@ -636,7 +691,8 @@ def overview(s: Session, provider_id: Optional[int] = None) -> dict:
             "prompt_tokens": round(x.prompt_tokens or 0),
             "avg_gen_tps": round(x.avg_gen_tps, 1) if x.avg_gen_tps else None,
             "mtp_acc": round(x.mtp_acc, 1) if x.mtp_acc is not None else None,
-            "status": x.status, "context_max": x.context_max,
+            "status": _effective_session_status(x, now), "context_max": x.context_max,
+            "live": _session_live(x, now),
         })
 
     return {
@@ -673,12 +729,18 @@ def live_snapshot(s: Session) -> dict:
         ctx_pct = round(r.context_used / r.context_max * 100.0, 1) if (r.context_used and r.context_max) else None
         current = {
             "provider": p.name, "model": model.name if model else None,
+            "model_id": model.id if model else None,
             "color": model.color if model else "#4b8de8", "state": r.state,
             "gen_tps": r.gen_tps, "prompt_tps": r.prompt_tps,
             "context_used": r.context_used, "context_max": r.context_max,
             "context_pct": ctx_pct, "mtp_acc": r.mtp_acc,
             "session_elapsed_s": round(max(0.0, (now - sess.start_at) / 1000.0)) if sess else None,
+            "live": _session_live(sess, now),
         }
+        if current["live"]:
+            current["state"] = "GENERATING" if current["live"].get("gen_tokens", 0) > 0 else "PROMPTING"
+            current["gen_tps"] = current["live"].get("gen_tps")
+            current["context_used"] = current["live"].get("context")
     day_start = local_day_start_ms(now)
     samples = fetch_samples(s, [p.id for p in provs], day_start)
     acc: dict[int, ModelAcc] = {}
@@ -727,6 +789,7 @@ def model_detail(s: Session, model_id: int, range_key: str) -> dict:
             "first_seen": m.first_seen_at, "last_used": m.last_used_at,
             "provider": provider.name if provider else None,
             "live_state": _live_state(s, m.id, now),
+            "live": _model_live(s, m.id, now),
         },
         "range": range_key,
         "accounting": {
@@ -884,12 +947,16 @@ def sessions_page(s: Session, provider_id: Optional[int], model_id: Optional[int
             "mtp_acc": round(x.mtp_acc, 1) if x.mtp_acc is not None else None,
             "mtp_enabled": x.mtp_enabled,
             "context_max": x.context_max,
-            "status": x.status,
+            "status": _effective_session_status(x, now),
+            "live": _session_live(x, now),
         })
+    out.sort(key=lambda item: (item["status"] not in ("ACTIVE", "FINALIZING"),
+                               -item["start"]))
     return {"sessions": out, "now": now}
 
 
 def session_detail(s: Session, session_id: int) -> dict:
+    now = now_ms()
     x = s.get(SessionRow, session_id)
     if x is None:
         return {}
@@ -933,10 +1000,15 @@ def session_detail(s: Session, session_id: int) -> dict:
         _gpu_rows(s, x.provider_id, start, end, session_id=session_id),
         start, end, bucket,
     )
+    live_info = _session_live(x, now)
+    if live_info and series["gen_tps"]:
+        series["gen_tps"][-1] = live_info.get("gen_tps")
+        if live_info.get("context") is not None:
+            series["context"][-1] = live_info["context"]
     return {
         "session": {
             "id": x.id, "start": x.start_at, "end": x.end_at,
-            "duration_s": x.duration_s, "status": x.status,
+            "duration_s": x.duration_s, "status": _effective_session_status(x, now),
             "provider": p.name if p else None,
             "model": m.name if m else None, "color": m.color if m else None,
             "model_id": x.model_id, "quant": m.quant if m else None,
@@ -958,6 +1030,7 @@ def session_detail(s: Session, session_id: int) -> dict:
             "vram_used_mb": round(x.vram_used_mb) if x.vram_used_mb else None,
             "ram_used_mb": round(x.ram_used_mb) if x.ram_used_mb else None,
             "power_w": round(x.power_w, 1) if x.power_w else None,
+            "live": live_info,
             "gpus": [{k: gpu[k] for k in
                       ("key", "index", "uuid", "name", "label", "color",
                        "pcie", "vram_total_mb", "summary")}
@@ -966,13 +1039,105 @@ def session_detail(s: Session, session_id: int) -> dict:
         "config": _config_out(cfg) if cfg else None,
         "graphs": {"labels": labels, "series": series, "gpus": gpu_data,
                    "span_s": round((end - start) / 1000.0)},
-        "now": now_ms(),
+        "now": now,
     }
 
 
 # ---------------------------------------------------------------------------
 # Compare
 # ---------------------------------------------------------------------------
+def compare_model_candidates(s: Session, provider_id: Optional[int],
+                             range_key: str) -> list[dict]:
+    data = models_page(s, provider_id, range_key, "family")
+    return [{k: row.get(k) for k in
+             ("key", "label", "model_ids", "color", "tokens", "gen_tps",
+              "peak_gen", "inference_s", "loaded_s")}
+            for row in data.get("rows", [])]
+
+
+def compare_models(s: Session, keys: list[str], provider_id: Optional[int],
+                   range_key: str) -> dict:
+    now = now_ms()
+    start = range_start_ms(range_key, now)
+    providers = list(s.exec(select(Provider)).all())
+    if provider_id:
+        providers = [p for p in providers if p.id == provider_id]
+    prov_ids = [p.id for p in providers]
+    models = list(s.exec(select(Model).where(Model.provider_id.in_(prov_ids))).all()) if prov_ids else []
+    by_family: dict[str, list[Model]] = {}
+    for model in models:
+        by_family.setdefault(model.family or model.name, []).append(model)
+    out = []
+    for key in keys[:5]:
+        family_models = by_family.get(key) or []
+        if not family_models:
+            continue
+        mids = [model.id for model in family_models]
+        samples = fetch_samples(s, prov_ids, start, model_ids=mids)
+        acc: dict[int, ModelAcc] = {}
+        accumulate(samples, acc, start, now, now)
+        values = [acc.get(mid) or ModelAcc() for mid in mids]
+        prompt_tokens = sum(value.prompt_tokens for value in values)
+        gen_tokens = sum(value.gen_tokens for value in values)
+        prompt_time = sum(value.prompt_time for value in values)
+        gen_time = sum(value.gen_time for value in values)
+        loaded = sum(value.loaded_time for value in values)
+        idle = sum(value.idle_time for value in values)
+        proposed = sum(value.d_proposed for value in values)
+        accepted = sum(value.d_accepted for value in values)
+        inference = prompt_time + gen_time
+        configs = list(s.exec(select(ModelConfig).where(ModelConfig.model_id.in_(mids))).all())
+
+        def mixed(attr: str):
+            vals = {getattr(cfg, attr) for cfg in configs if getattr(cfg, attr) not in (None, "")}
+            if not vals:
+                return None
+            return next(iter(vals)) if len(vals) == 1 else "mixed"
+
+        gpu_rows = []
+        for pid in sorted({model.provider_id for model in family_models}):
+            rows = _gpu_rows(s, pid, start, now)
+            gpu_rows.extend(row for row in rows
+                            if set(_json_ids(row.active_model_ids)).intersection(mids))
+        gpu_start = min((row.ts for row in gpu_rows), default=now) if start == 0 else start
+        gpu_data = _gpu_series(gpu_rows, gpu_start, now,
+                               max(2, RANGE_BUCKETS.get(range_key, 3600)))
+        builds = {_build_str(_latest_build(s, pid)) for pid in
+                  {model.provider_id for model in family_models}}
+        builds.discard(None)
+        build = next(iter(builds)) if len(builds) == 1 else ("mixed" if builds else None)
+        variants = sorted({model.name for model in family_models})
+        quants = sorted({model.quant for model in family_models if model.quant})
+        out.append({
+            "key": key, "model": key, "color": family_models[0].color,
+            "variants": variants, "quants": quants,
+            "providers": sorted({s.get(Provider, model.provider_id).name
+                                 for model in family_models if s.get(Provider, model.provider_id)}),
+            "tokens": round(prompt_tokens + gen_tokens),
+            "prompt_tokens": round(prompt_tokens), "gen_tokens": round(gen_tokens),
+            "prompt_tps": round(prompt_tokens / prompt_time, 1) if prompt_time > 0 else None,
+            "avg_gen_tps": round(gen_tokens / gen_time, 1) if gen_time > 0 else None,
+            "peak_prompt_tps": round(max((value.peak_prompt for value in values), default=0), 1) or None,
+            "peak_gen_tps": round(max((value.peak_gen for value in values), default=0), 1) or None,
+            "inference_s": round(inference), "loaded_s": round(loaded), "idle_s": round(idle),
+            "utilization": round(inference / loaded * 100.0, 1) if loaded > 0 else None,
+            "context_max": max((value.context_max for value in values), default=0) or None,
+            "mtp_proposed": round(proposed), "mtp_accepted": round(accepted),
+            "mtp_rejected": round(max(0.0, proposed - accepted)),
+            "mtp_acc": round(accepted / proposed * 100.0, 1) if proposed > 0 else None,
+            "configuration": "mixed" if len({cfg.fingerprint for cfg in configs}) > 1 else
+                             ("single" if configs else None),
+            "kv_cache": mixed("kv_cache_k") if mixed("kv_cache_k") == "mixed" else
+                        (f"{mixed('kv_cache_k') or '-'}/{mixed('kv_cache_v') or '-'}" if configs else None),
+            "split_mode": mixed("split_mode"), "reasoning_effort": mixed("reasoning_effort"),
+            "gpus": [{"index": gpu["index"], "label": gpu["label"],
+                      "color": gpu["color"], "summary": gpu["summary"]}
+                     for gpu in gpu_data],
+            "build": build,
+        })
+    return {"models": out, "range": range_key, "now": now}
+
+
 def compare(s: Session, ids: list[int]) -> dict:
     out = []
     models = {m.id: m for m in s.exec(select(Model)).all()}
@@ -1133,7 +1298,7 @@ def status(s: Session) -> dict:
                 agent_status = "OFFLINE"
         b = _latest_build(s, p.id)
         provs.append({
-            "name": p.name, "url": p.base_url, "status": p.status,
+            "id": p.id, "name": p.name, "url": p.base_url, "status": p.status,
             "last_success_ago": _fmt_ago(p.last_success_at, now),
             "latency_ms": p.latency_ms, "last_error": p.last_error,
             "agent_status": agent_status, "agent_url": p.agent_url,
