@@ -54,6 +54,7 @@ class ScreenshotTests(unittest.TestCase):
         self.assertIn('id="cmpCapture"', template)
         self.assertIn('data-capture-target="cmpCapture"', template)
         self.assertIn('data-capture-width="1200"', template)
+        self.assertIn('data-capture-ignore', template)
 
     def test_capture_uses_visible_preview_instead_of_popup(self):
         script_path = os.path.join(app.BASE_DIR, "static", "js", "app.js")

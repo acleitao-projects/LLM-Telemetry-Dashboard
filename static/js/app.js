@@ -1434,12 +1434,12 @@ function initCompare(meta) {
         el("cmpTable").innerHTML = '<div class="compare-error">The selected model files could not be compared in this range.</div>';
         return;
       }
-      let html = '<table class="data-table"><tr><th style="width:150px"></th>' + models.map((x, i) =>
-        '<th><div class="cmp-model-head"><div class="cmp-model-top"><span class="cmp-model-index">0' + (i + 1) +
+      let html = '<div class="cmp-model-header" style="--model-count:' + models.length + '">' + models.map((x, i) =>
+        '<div class="cmp-model-head"><div class="cmp-model-top"><span class="cmp-model-index">0' + (i + 1) +
         '</span><span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span>' +
         '<span class="cmp-model-name">' + esc(x.model) + '</span></div><div class="cmp-model-meta">' +
         esc([x.quant, (x.providers || []).join(" · ")].filter(Boolean).join(" · ") || "observed model file") +
-        "</div></div></th>").join("") + "</tr>";
+        "</div></div>").join("") + '</div><table class="data-table">';
       rowGroups.forEach(([group, rows]) => {
         html += '<tr class="cmp-section-row"><td colspan="' + (models.length + 1) + '">' + esc(group) + "</td></tr>";
         rows.forEach(([label, get, mode]) => {

@@ -408,20 +408,20 @@ tr.selected .share-bar i { background: var(--blue); }
 /* compare */
 .cmp-pick { max-height: 420px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); }
 .compare-layout { display: grid; grid-template-columns: minmax(250px, 340px) minmax(0, 1fr); gap: 12px; align-items: start; }
-.compare-output-head { display: flex; align-items: center; justify-content: space-between; min-height: 30px; margin-bottom: 6px; font-size: 11px; }
+.compare-output-head { align-items: center; min-height: 42px; margin: 0; padding: 0 12px; border-bottom: 1px solid var(--border); font-size: 11px; }
 .compare-capture { min-width: 0; padding: 0; overflow: hidden; border-radius: 10px; background: var(--panel); }
 .compare-result { min-width: 0; overflow-x: auto; }
 .compare-result .data-table { min-width: 760px; }
-.compare-result .data-table th, .compare-result .data-table td { white-space: normal; min-width: 170px; vertical-align: middle; padding: 8px 12px; }
-.compare-result .data-table th:first-child, .compare-result .data-table td:first-child {
+.compare-result .data-table td { white-space: normal; min-width: 170px; vertical-align: middle; padding: 8px 12px; }
+.compare-result .data-table td:first-child {
   min-width: 130px; position: sticky; left: 0; z-index: 1; background: var(--panel);
 }
-.compare-result .data-table th { padding: 0; }
-.compare-result .data-table th:first-child { padding: 8px 12px; }
-.cmp-model-head { min-height: 78px; padding: 12px; border-left: 1px solid var(--row-border); text-align: left; }
+.cmp-model-header { display: grid; grid-template-columns: repeat(var(--model-count), minmax(0, 1fr)); border-bottom: 1px solid var(--border); min-width: 760px; }
+.cmp-model-head { min-height: 88px; padding: 15px 16px; border-left: 1px solid var(--row-border); text-align: left; }
+.cmp-model-head:first-child { border-left: 0; }
 .cmp-model-head .cmp-model-top { display: flex; align-items: center; gap: 8px; }
 .cmp-model-head .cmp-model-index { color: var(--text-3); font-size: 10px; }
-.cmp-model-head .cmp-model-name { min-width: 0; overflow: hidden; color: var(--text); font-size: 12px; font-weight: 700; text-overflow: ellipsis; }
+.cmp-model-head .cmp-model-name { min-width: 0; overflow: hidden; color: var(--text); font-size: 15px; font-weight: 750; letter-spacing: .01em; text-overflow: ellipsis; }
 .cmp-model-head .cmp-model-meta { margin-top: 7px; color: var(--text-3); font-size: 9.5px; font-weight: 500; line-height: 1.5; }
 .cmp-section-row td { position: static !important; min-width: 0 !important; padding: 8px 12px 5px !important; color: var(--text-3); background: var(--panel-2) !important; font-size: 9px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
 .compare-deltas { border-top: 1px solid var(--border); padding: 10px 12px 12px; }
