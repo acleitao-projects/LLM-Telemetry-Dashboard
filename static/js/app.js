@@ -12,6 +12,52 @@ const DETAIL_RANGES = ["1m", "5m", "15m", "1h", "session", "24h", "7d", "30d"];
 window.META = null;
 window.__onLive = null;
 
+function initShell() {
+  const body = document.body;
+  const sidebarToggle = el("sidebarToggle");
+  const themeToggle = el("themeToggle");
+  const savedSidebar = localStorage.getItem("llm-telemetry-sidebar");
+  const compactViewport = matchMedia("(max-width: 800px)").matches;
+  const collapsed = savedSidebar ? savedSidebar === "collapsed" : compactViewport;
+
+  const setSidebar = (isCollapsed) => {
+    body.classList.toggle("sidebar-collapsed", isCollapsed);
+    if (sidebarToggle) {
+      sidebarToggle.setAttribute("aria-expanded", String(!isCollapsed));
+      sidebarToggle.title = isCollapsed ? "Expand sidebar" : "Collapse sidebar";
+      const label = sidebarToggle.querySelector("span");
+      if (label) label.textContent = isCollapsed ? "Expand" : "Collapse";
+    }
+    localStorage.setItem("llm-telemetry-sidebar", isCollapsed ? "collapsed" : "expanded");
+    requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+  };
+  setSidebar(collapsed);
+  if (sidebarToggle) sidebarToggle.onclick = () => setSidebar(!body.classList.contains("sidebar-collapsed"));
+
+  const syncThemeToggle = () => {
+    if (!themeToggle) return;
+    const current = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+    const next = current === "light" ? "dark" : "light";
+    themeToggle.setAttribute("aria-label", "Switch to " + next + " mode");
+    themeToggle.title = "Switch to " + next + " mode";
+  };
+  syncThemeToggle();
+  if (themeToggle) themeToggle.onclick = () => {
+    const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+    localStorage.setItem("llm-telemetry-theme", next);
+    document.documentElement.dataset.theme = next;
+    syncThemeToggle();
+    location.reload();
+  };
+
+  const captureDialog = el("captureDialog");
+  const captureClose = el("captureClose");
+  if (captureClose && captureDialog) captureClose.onclick = () => captureDialog.close();
+  if (captureDialog) captureDialog.onclick = (event) => {
+    if (event.target === captureDialog) captureDialog.close();
+  };
+}
+
 function esc(x) {
   return String(x == null ? "" : x).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -304,15 +350,12 @@ async function capturePanelAtWidth(target, width) {
 document.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-capture-target]");
   if (!button) return;
+  if (button.classList.contains("is-capturing")) return;
   event.stopPropagation();
   event.preventDefault();
-  const tabName = "telemetry-capture-" + Date.now();
   const captureId = newCaptureId();
-  const waitUrl = "/screenshots/" + captureId + "/wait";
-  button.href = waitUrl;
-  button.target = tabName;
-  const captureTab = window.open(waitUrl, tabName);
   button.classList.add("is-capturing");
+  button.setAttribute("aria-busy", "true");
   try {
     const requestedWidth = Math.max(0, Number(button.dataset.captureWidth) || 0);
     const pngUrl = await capturePanelAtWidth(
@@ -323,11 +366,28 @@ document.addEventListener("click", async (event) => {
       method: "PUT", headers: { "Content-Type": "image/png" }, body: png,
     });
     if (!response.ok) throw new Error(await response.text() || "Screenshot upload failed");
+    const result = await response.json();
+    const imageUrl = result.url || ("/screenshots/" + captureId + ".png");
+    const dialog = el("captureDialog"), preview = el("capturePreview");
+    const open = el("captureOpen"), download = el("captureDownload"), title = el("captureTitle");
+    if (title) title.textContent = "Screenshot ready";
+    if (preview) { preview.hidden = false; preview.src = imageUrl; }
+    if (open) { open.hidden = false; open.href = imageUrl; }
+    if (download) { download.hidden = false; download.href = imageUrl; download.download = "llm-telemetry-" + captureId + ".png"; }
+    if (dialog && typeof dialog.showModal === "function") { if (!dialog.open) dialog.showModal(); }
+    else location.assign(imageUrl);
   } catch (error) {
     console.error("Screenshot capture failed", error);
-    if (captureTab) captureTab.location.replace("/models?capture_error=1");
+    const dialog = el("captureDialog"), preview = el("capturePreview");
+    const open = el("captureOpen"), download = el("captureDownload"), title = el("captureTitle");
+    if (title) title.textContent = "Screenshot failed: " + (error.message || "unknown error");
+    if (preview) preview.hidden = true;
+    if (open) open.hidden = true;
+    if (download) download.hidden = true;
+    if (dialog && typeof dialog.showModal === "function") { if (!dialog.open) dialog.showModal(); }
   } finally {
     button.classList.remove("is-capturing");
+    button.removeAttribute("aria-busy");
   }
 });
 
@@ -1275,14 +1335,48 @@ function initCompare(meta) {
       };
     });
   };
+  let compareRequest = 0;
+  const renderDeltas = (models) => {
+    const panel = el("cmpDeltaPanel"), box = el("cmpDeltas");
+    if (!panel || !box || models.length < 2) { if (panel) panel.hidden = true; return; }
+    const metrics = [
+      ["Generated tokens", "gen_tokens", (value) => fmtTokens(value)],
+      ["Avg gen t/s", "avg_gen_tps", (value) => value == null ? "—" : value + " t/s"],
+      ["Inference time", "inference_s", (value) => fmtDur(value)],
+      ["Utilization", "utilization", (value) => value == null ? "—" : value + "%"],
+    ];
+    let html = '<div class="table-scroll"><table class="data-table"><tr><th>Change</th>' +
+      metrics.map(([label]) => "<th>" + esc(label) + "</th>").join("") + "</tr>";
+    for (let index = 1; index < models.length; index += 1) {
+      const before = models[index - 1], after = models[index];
+      html += "<tr><td>" + esc(before.model) + " → " + esc(after.model) + "</td>";
+      metrics.forEach(([, key, format]) => {
+        const a = Number(before[key]), b = Number(after[key]);
+        const pct = Number.isFinite(a) && Number.isFinite(b) && a !== 0 ? (b - a) / Math.abs(a) * 100 : null;
+        const cls = pct == null || pct === 0 ? "" : pct > 0 ? " cmp-delta-up" : " cmp-delta-down";
+        html += '<td class="num' + cls + '">' + esc(format(after[key])) +
+          (pct == null ? "" : " (" + (pct > 0 ? "+" : "") + pct.toFixed(1) + "%)") + "</td>";
+      });
+      html += "</tr>";
+    }
+    box.innerHTML = html + "</table></div>";
+    panel.hidden = false;
+  };
   const loadCompare = () => {
+    const requestId = ++compareRequest;
     el("cmpDeltaPanel").hidden = true;
     if (st.selected.length < 2) {
       el("cmpTable").innerHTML = '<div class="empty">select at least two model families to compare</div>';
       return;
     }
+    el("cmpTable").innerHTML = '<div class="compare-loading"><span class="spin"></span>loading comparison…</div>';
     api(query("/api/compare/models", true)).then((data) => {
+      if (requestId !== compareRequest) return;
       const models = data.models || [];
+      if (models.length < 2) {
+        el("cmpTable").innerHTML = '<div class="compare-error">The selected model families could not be compared in this range.</div>';
+        return;
+      }
       let html = '<table class="data-table"><tr><th style="width:150px"></th>' + models.map((x) =>
         '<th><span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span> ' + esc(x.model) + "</th>").join("") + "</tr>";
       rows.forEach(([label, get, mode]) => {
@@ -1294,14 +1388,33 @@ function initCompare(meta) {
           '<td class="num' + (i === best ? " diff-hl" : "") + '">' + esc(value == null ? "—" : value) + "</td>").join("") + "</tr>";
       });
       el("cmpTable").innerHTML = html + "</table>";
+      renderDeltas(models);
+    }).catch((error) => {
+      if (requestId !== compareRequest) return;
+      console.error("compare", error);
+      el("cmpTable").innerHTML = '<div class="compare-error">Comparison failed to load. Please try again.</div>';
     });
   };
-  const loadCandidates = () => api(query("/api/compare/models/candidates", false)).then((data) => {
-    st.candidates = data.models || [];
-    const available = new Set(st.candidates.map((x) => x.key));
-    st.selected = st.selected.filter((key) => available.has(key));
-    renderPick(); loadCompare();
-  });
+  let candidateRequest = 0;
+  const loadCandidates = () => {
+    const requestId = ++candidateRequest;
+    el("cmpPick").innerHTML = '<div class="compare-loading"><span class="spin"></span>loading models…</div>';
+    return api(query("/api/compare/models/candidates", false)).then((data) => {
+      if (requestId !== candidateRequest) return;
+      st.candidates = data.models || [];
+      const available = new Set(st.candidates.map((x) => x.key));
+      st.selected = st.selected.filter((key) => available.has(key));
+      renderPick(); loadCompare();
+    }).catch((error) => {
+      if (requestId !== candidateRequest) return;
+      console.error("compare candidates", error);
+      st.candidates = [];
+      st.selected = [];
+      el("cmpCount").textContent = "unavailable";
+      el("cmpPick").innerHTML = '<div class="compare-error">Models failed to load. Please try again.</div>';
+      el("cmpTable").innerHTML = '<div class="empty">comparison unavailable</div>';
+    });
+  };
   fillSelect(el("cmpProvider"), "All providers", providers.map((p) => [p.id, p.name]), st.provider);
   el("cmpProvider").onchange = (event) => { st.provider = event.target.value; loadCandidates(); };
   segControl("cmpRange", RANGES.map((r) => RANGE_LABELS[r]), RANGE_LABELS[st.range], (label) => {
@@ -1573,7 +1686,10 @@ function initSettings(meta) {
     fetch("/api/settings/display", {
       method: "PUT", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ default_range: r.value, default_group: g.value, theme: t.value }),
-    }).then((x) => x.json()).then(() => { location.reload(); });
+    }).then((x) => x.json()).then(() => {
+      localStorage.setItem("llm-telemetry-theme", t.value);
+      location.reload();
+    });
   };
 
   loadAll().then(([st, provs, disp]) => {
@@ -1584,4 +1700,4 @@ function initSettings(meta) {
   return Promise.resolve();
 }
 
-document.addEventListener("DOMContentLoaded", bootstrap);
+document.addEventListener("DOMContentLoaded", () => { initShell(); bootstrap(); });

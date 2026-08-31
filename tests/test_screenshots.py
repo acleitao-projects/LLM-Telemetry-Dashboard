@@ -44,6 +44,32 @@ class ScreenshotTests(unittest.TestCase):
         self.assertIn("crypto.getRandomValues(new Uint8Array(16))", script)
         self.assertIn("const captureId = newCaptureId()", script)
 
+    def test_capture_uses_visible_preview_instead_of_popup(self):
+        script_path = os.path.join(app.BASE_DIR, "static", "js", "app.js")
+        with open(script_path, encoding="utf-8") as source:
+            script = source.read()
+        template_path = os.path.join(app.BASE_DIR, "templates", "base.html")
+        with open(template_path, encoding="utf-8") as source:
+            template = source.read()
+
+        self.assertIn('el("captureDialog")', script)
+        self.assertIn('dialog.showModal()', script)
+        self.assertNotIn("window.open(waitUrl", script)
+        self.assertIn('id="captureDownload"', template)
+
+    def test_responsive_theme_and_sidebar_controls_are_present(self):
+        template_path = os.path.join(app.BASE_DIR, "templates", "base.html")
+        with open(template_path, encoding="utf-8") as source:
+            template = source.read()
+        css_path = os.path.join(app.BASE_DIR, "static", "css", "app.css")
+        with open(css_path, encoding="utf-8") as source:
+            css = source.read()
+
+        self.assertIn('id="sidebarToggle"', template)
+        self.assertIn('id="themeToggle"', template)
+        self.assertIn(':root[data-theme="light"]', css)
+        self.assertIn('@media (max-width: 800px)', css)
+
     def test_selected_gauge_capture_preserves_ratio_and_detail_clearance(self):
         css_path = os.path.join(app.BASE_DIR, "static", "css", "app.css")
         with open(css_path, encoding="utf-8") as source:
