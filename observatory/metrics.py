@@ -650,10 +650,12 @@ def accumulate(samples: list[TelemetrySample], acc: dict[int, ModelAcc],
 
 
 def aggregate_samples(s: Session, prov_ids: list[int], start_ms: int,
-                      end_ms: int, now: int) -> dict[int, ModelAcc]:
+                      end_ms: int, now: int,
+                      model_ids: Optional[list[int]] = None) -> dict[int, ModelAcc]:
     """Aggregate one telemetry window in SQLite without ORM materialization."""
     if not prov_ids:
         return {}
+    model_filter = " AND current.model_id IN :model_ids" if model_ids else ""
     stmt = text("""
         WITH ordered AS (
             SELECT current.model_id, current.ts, current.state,
@@ -662,30 +664,27 @@ def aggregate_samples(s: Session, prov_ids: list[int], start_ms: int,
                    current.prompt_tps, current.gen_tps,
                    current.mtp_proposed_total, current.mtp_accepted_total,
                    current.context_used,
-                   previous.ts AS prev_ts, previous.state AS prev_state,
-                   previous.tokens_total AS prev_tokens_total,
-                   previous.prompt_total AS prev_prompt_total,
-                   previous.gen_total AS prev_gen_total,
-                   previous.prompt_seconds_total AS prev_prompt_seconds,
-                   previous.gen_seconds_total AS prev_gen_seconds,
-                   previous.mtp_proposed_total AS prev_proposed,
-                   previous.mtp_accepted_total AS prev_accepted,
-                   NOT EXISTS (
-                       SELECT 1 FROM telemetrysample AS later
-                       WHERE later.provider_id = current.provider_id
-                         AND later.model_id = current.model_id
-                         AND later.ts > current.ts AND later.ts <= :end_ms
-                   ) AS is_last
+                   LAG(current.ts) OVER sample_window AS prev_ts,
+                   LAG(current.state) OVER sample_window AS prev_state,
+                   LAG(current.tokens_total) OVER sample_window AS prev_tokens_total,
+                   LAG(current.prompt_total) OVER sample_window AS prev_prompt_total,
+                   LAG(current.gen_total) OVER sample_window AS prev_gen_total,
+                   LAG(current.prompt_seconds_total) OVER sample_window AS prev_prompt_seconds,
+                   LAG(current.gen_seconds_total) OVER sample_window AS prev_gen_seconds,
+                   LAG(current.mtp_proposed_total) OVER sample_window AS prev_proposed,
+                   LAG(current.mtp_accepted_total) OVER sample_window AS prev_accepted,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY current.provider_id, current.model_id
+                       ORDER BY current.ts DESC
+                   ) = 1 AS is_last
             FROM telemetrysample AS current
-            LEFT JOIN telemetrysample AS previous ON previous.id = (
-                SELECT candidate.id FROM telemetrysample AS candidate
-                WHERE candidate.provider_id = current.provider_id
-                  AND candidate.model_id = current.model_id
-                  AND candidate.ts >= :start_ms AND candidate.ts < current.ts
-                ORDER BY candidate.ts DESC LIMIT 1
-            )
             WHERE current.provider_id IN :provider_ids
               AND current.ts >= :start_ms AND current.ts <= :end_ms
+              {model_filter}
+            WINDOW sample_window AS (
+                PARTITION BY current.provider_id, current.model_id
+                ORDER BY current.ts
+            )
         ), deltas AS (
             SELECT *,
                    CASE WHEN tokens_total > prev_tokens_total
@@ -727,11 +726,17 @@ def aggregate_samples(s: Session, prov_ids: list[int], start_ms: int,
                MAX(gen_tps), MAX(prompt_tps), MAX(context_used)
         FROM deltas
         GROUP BY model_id
-    """).bindparams(bindparam("provider_ids", expanding=True))
-    rows = s.execute(stmt, {
+    """.format(model_filter=model_filter)).bindparams(
+        bindparam("provider_ids", expanding=True),
+        *([bindparam("model_ids", expanding=True)] if model_ids else []),
+    )
+    params = {
         "provider_ids": prov_ids, "start_ms": start_ms, "end_ms": end_ms,
         "now_ms": now, "dt_cap": DT_CAP_S,
-    }).all()
+    }
+    if model_ids:
+        params["model_ids"] = model_ids
+    rows = s.execute(stmt, params).all()
     out: dict[int, ModelAcc] = {}
     for row in rows:
         a = ModelAcc()
@@ -1489,12 +1494,44 @@ def session_detail(s: Session, session_id: int) -> dict:
 # ---------------------------------------------------------------------------
 def compare_model_candidates(s: Session, provider_id: Optional[int],
                              range_key: str) -> list[dict]:
-    data = models_page(s, provider_id, range_key, "model")
-    return [{k: row.get(k) for k in
-             ("key", "label", "model_ids", "color", "quant", "family", "provider",
-              "tokens", "share", "sessions", "gen_tps", "peak_gen", "inference_s",
-              "loaded_s", "active", "active_status", "active_tasks")}
-            for row in data.get("rows", [])]
+    now = now_ms()
+    start = range_start_ms(range_key, now)
+    providers = list(s.exec(select(Provider)).all())
+    if provider_id:
+        providers = [provider for provider in providers if provider.id == provider_id]
+    provider_names = {provider.id: provider.name for provider in providers}
+    prov_ids = list(provider_names)
+    if not prov_ids:
+        return []
+    models = list(s.exec(select(Model).where(Model.provider_id.in_(prov_ids))).all())
+    model_ids = [model.id for model in models]
+    acc = aggregate_samples(s, prov_ids, start, now, now)
+    sessions = _sessions_by_model(sessions_in_range(s, prov_ids, start))
+    active = _active_models(s, now, model_ids)
+    total_tokens = sum(item.tokens for item in acc.values())
+    out = []
+    for model in models:
+        item = acc.get(model.id) or ModelAcc()
+        live = active.get(model.id)
+        if item.tokens <= 0 and model.id not in sessions and live is None:
+            continue
+        inference = item.prompt_time + item.gen_time
+        out.append({
+            "key": str(model.id), "label": model.name, "model_ids": [model.id],
+            "color": model.color, "quant": model.quant, "family": model.family,
+            "provider": provider_names.get(model.provider_id),
+            "tokens": round(item.tokens),
+            "share": round(item.tokens / total_tokens * 100.0, 1) if total_tokens else 0.0,
+            "sessions": len(sessions.get(model.id, [])),
+            "gen_tps": round(item.gen_tokens / item.gen_time, 1) if item.gen_time > 0 else None,
+            "peak_gen": round(item.peak_gen, 1) if item.peak_gen else None,
+            "inference_s": round(inference), "loaded_s": round(item.loaded_time),
+            "active": live is not None,
+            "active_status": live.get("status") if live else None,
+            "active_tasks": live.get("task_count", 0) if live else 0,
+        })
+    out.sort(key=lambda row: row["tokens"], reverse=True)
+    return out
 
 
 def compare_models(s: Session, keys: list[str], provider_id: Optional[int],
@@ -1507,17 +1544,27 @@ def compare_models(s: Session, keys: list[str], provider_id: Optional[int],
     prov_ids = [p.id for p in providers]
     models = list(s.exec(select(Model).where(Model.provider_id.in_(prov_ids))).all()) if prov_ids else []
     by_id = {str(model.id): model for model in models}
+    selected_models = [by_id[key] for key in keys[:5] if key in by_id]
+    selected_ids = [model.id for model in selected_models]
+    samples = fetch_overview_samples(s, prov_ids, start, model_ids=selected_ids)
+    all_acc: dict[int, ModelAcc] = {}
+    accumulate(samples, all_acc, start, now, now)
+    all_configs = (list(s.exec(select(ModelConfig).where(
+        ModelConfig.model_id.in_(selected_ids))).all()) if selected_ids else [])
+    configs_by_model: dict[int, list[ModelConfig]] = {}
+    for config in all_configs:
+        configs_by_model.setdefault(config.model_id, []).append(config)
+    provider_names = {provider.id: provider.name for provider in providers}
+    builds = {provider.id: _build_str(_latest_build(s, provider.id)) for provider in providers}
+    gpu_rows_by_provider = {
+        provider.id: _gpu_rows(s, provider.id, start, now) for provider in providers
+    }
     out = []
-    for key in keys[:5]:
-        model = by_id.get(key)
-        if model is None:
-            continue
+    for model in selected_models:
+        key = str(model.id)
         family_models = [model]
         mids = [model.id]
-        samples = fetch_samples(s, prov_ids, start, model_ids=mids)
-        acc: dict[int, ModelAcc] = {}
-        accumulate(samples, acc, start, now, now)
-        values = [acc.get(mid) or ModelAcc() for mid in mids]
+        values = [all_acc.get(model.id) or ModelAcc()]
         prompt_tokens = sum(value.prompt_tokens for value in values)
         gen_tokens = sum(value.gen_tokens for value in values)
         prompt_time = sum(value.prompt_time for value in values)
@@ -1527,7 +1574,7 @@ def compare_models(s: Session, keys: list[str], provider_id: Optional[int],
         proposed = sum(value.d_proposed for value in values)
         accepted = sum(value.d_accepted for value in values)
         inference = prompt_time + gen_time
-        configs = list(s.exec(select(ModelConfig).where(ModelConfig.model_id.in_(mids))).all())
+        configs = configs_by_model.get(model.id, [])
 
         def mixed(attr: str):
             vals = {getattr(cfg, attr) for cfg in configs if getattr(cfg, attr) not in (None, "")}
@@ -1537,24 +1584,25 @@ def compare_models(s: Session, keys: list[str], provider_id: Optional[int],
 
         gpu_rows = []
         for pid in sorted({model.provider_id for model in family_models}):
-            rows = _gpu_rows(s, pid, start, now)
+            rows = gpu_rows_by_provider.get(pid, [])
             gpu_rows.extend(row for row in rows
                             if set(_json_ids(row.active_model_ids)).intersection(mids))
         gpu_start = min((row.ts for row in gpu_rows), default=now) if start == 0 else start
         gpu_data = _gpu_series(gpu_rows, gpu_start, now,
                                max(2, RANGE_BUCKETS.get(range_key, 3600)))
-        builds = {_build_str(_latest_build(s, pid)) for pid in
-                  {model.provider_id for model in family_models}}
-        builds.discard(None)
-        build = next(iter(builds)) if len(builds) == 1 else ("mixed" if builds else None)
+        model_builds = {builds.get(pid) for pid in
+                        {item.provider_id for item in family_models}}
+        model_builds.discard(None)
+        build = next(iter(model_builds)) if len(model_builds) == 1 else \
+            ("mixed" if model_builds else None)
         variants = sorted({model.name for model in family_models})
         quants = sorted({model.quant for model in family_models if model.quant})
         out.append({
             "key": key, "model": model.name, "color": model.color,
             "family": model.family, "quant": model.quant,
             "variants": variants, "quants": quants,
-            "providers": sorted({s.get(Provider, item.provider_id).name
-                                 for item in family_models if s.get(Provider, item.provider_id)}),
+            "providers": sorted({provider_names[item.provider_id]
+                                 for item in family_models if item.provider_id in provider_names}),
             "tokens": round(prompt_tokens + gen_tokens),
             "prompt_tokens": round(prompt_tokens), "gen_tokens": round(gen_tokens),
             "prompt_tps": round(prompt_tokens / prompt_time, 1) if prompt_time > 0 else None,

@@ -459,8 +459,14 @@ class ModelFileCompareTests(unittest.TestCase):
             self.assertEqual({row["key"] for row in candidates},
                              {str(models[0].id), str(models[1].id)})
 
-            data = metrics.compare_models(
-                session, [str(models[0].id), str(models[1].id)], None, "7d")
+            with patch.object(metrics, "fetch_overview_samples",
+                              wraps=metrics.fetch_overview_samples) as fetch_samples, \
+                    patch.object(metrics, "_gpu_rows",
+                                 wraps=metrics._gpu_rows) as fetch_gpu:
+                data = metrics.compare_models(
+                    session, [str(models[0].id), str(models[1].id)], None, "7d")
+            self.assertEqual(fetch_samples.call_count, 1)
+            self.assertEqual(fetch_gpu.call_count, 1)
             first, second = data["models"]
             self.assertEqual(first["model"], "family-a-q4")
             self.assertEqual(first["avg_gen_tps"], 10.0)
