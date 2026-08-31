@@ -1,17 +1,18 @@
 /* Observatory - ECharts theme + helpers */
 "use strict";
 
+const LIGHT_THEME = document.documentElement.dataset.theme === "light";
 const OC = {
   bg: "transparent",
-  border: "#2a2a27",
-  split: "#21211e",
-  axis: "#343431",
-  label: "#74736e",
-  text: "#a6a49d",
-  blue: "#4b8de8",
-  orange: "#d8733e",
-  green: "#48a77c",
-  amber: "#d29b25",
+  border: LIGHT_THEME ? "#d5d8dc" : "#2a2a27",
+  split: LIGHT_THEME ? "#e3e5e8" : "#21211e",
+  axis: LIGHT_THEME ? "#b8bdc4" : "#343431",
+  label: LIGHT_THEME ? "#747b84" : "#74736e",
+  text: LIGHT_THEME ? "#4e545b" : "#a6a49d",
+  blue: LIGHT_THEME ? "#245fb5" : "#4b8de8",
+  orange: LIGHT_THEME ? "#b74f1f" : "#d8733e",
+  green: LIGHT_THEME ? "#287a54" : "#48a77c",
+  amber: LIGHT_THEME ? "#956814" : "#d29b25",
 };
 
 function baseOption() {
@@ -20,7 +21,7 @@ function baseOption() {
     grid: { left: 40, right: 10, top: 12, bottom: 22 },
     tooltip: {
       trigger: "axis",
-      backgroundColor: "#1e1e1b",
+      backgroundColor: LIGHT_THEME ? "#ffffff" : "#1e1e1b",
       borderColor: OC.border,
       borderWidth: 1,
       padding: [6, 10],
