@@ -46,6 +46,15 @@ class ScreenshotTests(unittest.TestCase):
         self.assertIn("crypto.getRandomValues(new Uint8Array(16))", script)
         self.assertIn("const captureId = newCaptureId()", script)
 
+    def test_compare_table_has_a_stable_capture_target(self):
+        template_path = os.path.join(app.BASE_DIR, "templates", "compare.html")
+        with open(template_path, encoding="utf-8") as source:
+            template = source.read()
+
+        self.assertIn('id="cmpCapture"', template)
+        self.assertIn('data-capture-target="cmpCapture"', template)
+        self.assertIn('data-capture-width="1200"', template)
+
     def test_capture_uses_visible_preview_instead_of_popup(self):
         script_path = os.path.join(app.BASE_DIR, "static", "js", "app.js")
         with open(script_path, encoding="utf-8") as source:

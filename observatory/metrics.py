@@ -806,6 +806,7 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
     if provider_id:
         provs = [p for p in provs if p.id == provider_id]
     prov_ids = [p.id for p in provs]
+    provider_names = {p.id: p.name for p in provs}
     if not prov_ids:
         return {"rows": [], "top": {}}
     models = list(s.exec(select(Model).where(Model.provider_id.in_(prov_ids))).all())
@@ -818,6 +819,8 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
     active_by_model = _active_models(s, now, list(m_by_id))
 
     def gkey(m: Model) -> str:
+        if group == "model":
+            return str(m.id)
         if group == "family":
             return m.family or m.name
         if group == "quant":
@@ -835,7 +838,11 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
             continue
         g = gkey(m)
         row = groups.setdefault(g, {
-            "key": g, "label": g, "model_ids": [], "tokens": 0.0, "gen_tokens": 0.0,
+            "key": g, "label": m.name if group == "model" else g,
+            "model_ids": [], "quant": m.quant if group == "model" else None,
+            "family": m.family if group == "model" else None,
+            "provider": provider_names.get(m.provider_id) if group == "model" else None,
+            "tokens": 0.0, "gen_tokens": 0.0,
             "prompt_tokens": 0.0, "gen_time": 0.0, "prompt_time": 0.0,
             "loaded_time": 0.0, "idle_time": 0.0,
             "peak_gen": 0.0, "peak_prompt": 0.0,
@@ -867,6 +874,7 @@ def models_page(s: Session, provider_id: Optional[int], range_key: str, group: s
         gen_tps = (row["gen_tokens"] / row["gen_time"]) if row["gen_time"] > 0 else None
         rows.append({
             "key": row["key"], "label": row["label"], "model_ids": row["model_ids"],
+            "quant": row["quant"], "family": row["family"], "provider": row["provider"],
             "color": row["color"], "tokens": round(row["tokens"]),
             "share": round(share, 1), "sessions": row["sessions"],
             "gen_tps": round(gen_tps, 1) if gen_tps else None,
@@ -1481,10 +1489,11 @@ def session_detail(s: Session, session_id: int) -> dict:
 # ---------------------------------------------------------------------------
 def compare_model_candidates(s: Session, provider_id: Optional[int],
                              range_key: str) -> list[dict]:
-    data = models_page(s, provider_id, range_key, "family")
+    data = models_page(s, provider_id, range_key, "model")
     return [{k: row.get(k) for k in
-             ("key", "label", "model_ids", "color", "tokens", "gen_tps",
-              "peak_gen", "inference_s", "loaded_s")}
+             ("key", "label", "model_ids", "color", "quant", "family", "provider",
+              "tokens", "share", "sessions", "gen_tps", "peak_gen", "inference_s",
+              "loaded_s", "active", "active_status", "active_tasks")}
             for row in data.get("rows", [])]
 
 
@@ -1497,15 +1506,14 @@ def compare_models(s: Session, keys: list[str], provider_id: Optional[int],
         providers = [p for p in providers if p.id == provider_id]
     prov_ids = [p.id for p in providers]
     models = list(s.exec(select(Model).where(Model.provider_id.in_(prov_ids))).all()) if prov_ids else []
-    by_family: dict[str, list[Model]] = {}
-    for model in models:
-        by_family.setdefault(model.family or model.name, []).append(model)
+    by_id = {str(model.id): model for model in models}
     out = []
     for key in keys[:5]:
-        family_models = by_family.get(key) or []
-        if not family_models:
+        model = by_id.get(key)
+        if model is None:
             continue
-        mids = [model.id for model in family_models]
+        family_models = [model]
+        mids = [model.id]
         samples = fetch_samples(s, prov_ids, start, model_ids=mids)
         acc: dict[int, ModelAcc] = {}
         accumulate(samples, acc, start, now, now)
@@ -1542,10 +1550,11 @@ def compare_models(s: Session, keys: list[str], provider_id: Optional[int],
         variants = sorted({model.name for model in family_models})
         quants = sorted({model.quant for model in family_models if model.quant})
         out.append({
-            "key": key, "model": key, "color": family_models[0].color,
+            "key": key, "model": model.name, "color": model.color,
+            "family": model.family, "quant": model.quant,
             "variants": variants, "quants": quants,
-            "providers": sorted({s.get(Provider, model.provider_id).name
-                                 for model in family_models if s.get(Provider, model.provider_id)}),
+            "providers": sorted({s.get(Provider, item.provider_id).name
+                                 for item in family_models if s.get(Provider, item.provider_id)}),
             "tokens": round(prompt_tokens + gen_tokens),
             "prompt_tokens": round(prompt_tokens), "gen_tokens": round(gen_tokens),
             "prompt_tps": round(prompt_tokens / prompt_time, 1) if prompt_time > 0 else None,

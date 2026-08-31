@@ -74,8 +74,9 @@ verify the whole pipeline end to end.
 - **Session detail** — TTFT, prompt/gen tokens and speeds, peaks, context
   peak, MTP acceptance, hardware averages, per-second series, the launch
   config that session ran with.
-- **Compare** — line up to five observed model families side by side across a
-  shared range. Files and quants are aggregated; nothing is executed.
+- **Compare** — line up to five specific observed model files side by side
+  across a shared range and export the comparison as a shareable PNG; nothing
+  is executed.
 - **Hardware** — host (CPU/RAM/GPU/driver/PCIe), authoritative llama.cpp build
   version/commit from `/props`, and 1 h per-GPU utilization, VRAM, temperature
   and power series alongside CPU/RAM. Live GPU cards use separate orange VRAM

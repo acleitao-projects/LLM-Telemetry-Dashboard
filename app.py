@@ -220,7 +220,7 @@ def create_app(demo: bool = False) -> FastAPI:
     def compare_page(request: Request):
         return templates.TemplateResponse(request, "base.html", {
             "page": "compare", "title": "Compare",
-            "subtitle": "Compare observed model families across the same time range.",
+            "subtitle": "Compare specific model files across the same time range.",
             "nav": NAV, "demo": demo, "query": {}, "template": "compare.html",
         })
 
@@ -308,9 +308,9 @@ def create_app(demo: bool = False) -> FastAPI:
     @app.get("/api/compare/models")
     def api_compare_models(keys: str = "", provider: Optional[int] = None,
                            range: str = "7d"):
-        family_keys = [x for x in keys.split("|") if x]
+        model_keys = [x for x in keys.split("|") if x]
         with odb.new_session() as s:
-            return m.compare_models(s, family_keys, provider, range)
+            return m.compare_models(s, model_keys, provider, range)
 
     @app.get("/api/hardware")
     def api_hardware(provider: Optional[int] = None):

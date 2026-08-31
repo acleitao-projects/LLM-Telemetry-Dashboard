@@ -1326,30 +1326,42 @@ function initSessionDetail(meta) {
 function initCompare(meta) {
   const providers = (meta && meta.providers) || [];
   const st = { range: "7d", provider: "", selected: [], candidates: [] };
-  const rows = [
-    ["Variants", (x) => (x.variants || []).join(" · ") || "—"],
-    ["Quants", (x) => (x.quants || []).join(" · ") || "—"],
-    ["Providers", (x) => (x.providers || []).join(" · ") || "—"],
-    ["Total tokens", (x) => fmtTokens(x.tokens)],
-    ["Prompt tokens", (x) => fmtTokens(x.prompt_tokens)],
-    ["Generated tokens", (x) => fmtTokens(x.gen_tokens)],
-    ["Avg prompt t/s", (x) => x.prompt_tps, "max"],
-    ["Peak prompt t/s", (x) => x.peak_prompt_tps, "max"],
-    ["Avg gen t/s", (x) => x.avg_gen_tps, "max"],
-    ["Peak gen t/s", (x) => x.peak_gen_tps, "max"],
-    ["Inference time", (x) => fmtDur(x.inference_s)],
-    ["Loaded / idle", (x) => fmtDur(x.loaded_s) + " / " + fmtDur(x.idle_s)],
-    ["Utilization", (x) => x.utilization != null ? x.utilization + "%" : "—", "max"],
-    ["Context max", (x) => x.context_max ? fmtNum(x.context_max) : "—"],
-    ["MTP acceptance", (x) => x.mtp_acc != null ? x.mtp_acc + "%" : "—", "max"],
-    ["MTP drafts", (x) => x.mtp_proposed ? fmtTokens(x.mtp_accepted) + " accepted / " + fmtTokens(x.mtp_rejected) + " rejected" : "—"],
-    ["Configuration", (x) => x.configuration || "—"],
-    ["KV cache", (x) => x.kv_cache || "—"],
-    ["Split / reasoning", (x) => (x.split_mode || "—") + " / " + (x.reasoning_effort || "—")],
-    ["Per-GPU averages", (x) => (x.gpus || []).map((g) => "GPU " + g.index + ": " +
-      (g.summary.util != null ? g.summary.util + "%" : "—") + " / " +
-      (g.summary.vram_mb != null ? fmtBytes(g.summary.vram_mb * 1024 * 1024) : "—")).join(" · ") || "—"],
-    ["Build", (x) => x.build || "—"],
+  const rowGroups = [
+    ["Model file", [
+      ["Family", (x) => x.family || "—"],
+      ["Quant", (x) => x.quant || "—"],
+      ["Provider", (x) => (x.providers || []).join(" · ") || "—"],
+    ]],
+    ["Tokens", [
+      ["Total tokens", (x) => fmtTokens(x.tokens)],
+      ["Prompt tokens", (x) => fmtTokens(x.prompt_tokens)],
+      ["Generated tokens", (x) => fmtTokens(x.gen_tokens)],
+    ]],
+    ["Throughput", [
+      ["Avg prompt t/s", (x) => x.prompt_tps, "max"],
+      ["Peak prompt t/s", (x) => x.peak_prompt_tps, "max"],
+      ["Avg gen t/s", (x) => x.avg_gen_tps, "max"],
+      ["Peak gen t/s", (x) => x.peak_gen_tps, "max"],
+    ]],
+    ["Runtime", [
+      ["Inference time", (x) => fmtDur(x.inference_s)],
+      ["Loaded / idle", (x) => fmtDur(x.loaded_s) + " / " + fmtDur(x.idle_s)],
+      ["Utilization", (x) => x.utilization != null ? x.utilization + "%" : "—", "max"],
+      ["Context max", (x) => x.context_max ? fmtNum(x.context_max) : "—"],
+    ]],
+    ["MTP", [
+      ["MTP acceptance", (x) => x.mtp_acc != null ? x.mtp_acc + "%" : "—", "max"],
+      ["MTP drafts", (x) => x.mtp_proposed ? fmtTokens(x.mtp_accepted) + " accepted / " + fmtTokens(x.mtp_rejected) + " rejected" : "—"],
+    ]],
+    ["Configuration", [
+      ["Configuration", (x) => x.configuration || "—"],
+      ["KV cache", (x) => x.kv_cache || "—"],
+      ["Split / reasoning", (x) => (x.split_mode || "—") + " / " + (x.reasoning_effort || "—")],
+      ["Per-GPU averages", (x) => (x.gpus || []).map((g) => "GPU " + g.index + ": " +
+        (g.summary.util != null ? g.summary.util + "%" : "—") + " / " +
+        (g.summary.vram_mb != null ? fmtBytes(g.summary.vram_mb * 1024 * 1024) : "—")).join(" · ") || "—"],
+      ["Build", (x) => x.build || "—"],
+    ]],
   ];
 
   const query = (path, includeKeys) => {
@@ -1364,9 +1376,11 @@ function initCompare(meta) {
       '<label class="cmp-row"><input type="checkbox" data-idx="' + i + '"' +
       (st.selected.includes(x.key) ? " checked" : "") + ">" +
       '<span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span>' +
-      '<span>' + esc(x.label) + '</span><span class="muted" style="margin-left:auto">' +
-      (x.gen_tps != null ? x.gen_tps + " t/s" : fmtTokens(x.tokens)) + "</span></label>").join("") :
-      '<div class="empty">no model-family activity in this range</div>';
+      '<span class="cmp-pick-name">' + esc(x.label) + '<small class="cmp-pick-meta">' +
+      esc([x.quant, x.provider].filter(Boolean).join(" · ") || x.family || "model file") + '</small></span>' +
+      '<span class="cmp-pick-stat">' + (x.gen_tps != null ? x.gen_tps + " t/s" : fmtTokens(x.tokens)) +
+      '<small>' + fmtTokens(x.tokens) + " · " + (x.share || 0) + "%</small></span></label>").join("") :
+      '<div class="empty">no model-file activity in this range</div>';
     el("cmpPick").querySelectorAll("input").forEach((input) => {
       input.onchange = () => {
         const key = st.candidates[Number(input.dataset.idx)].key;
@@ -1409,7 +1423,7 @@ function initCompare(meta) {
     const requestId = ++compareRequest;
     el("cmpDeltaPanel").hidden = true;
     if (st.selected.length < 2) {
-      el("cmpTable").innerHTML = '<div class="empty">select at least two model families to compare</div>';
+      el("cmpTable").innerHTML = '<div class="empty">select at least two model files to compare</div>';
       return;
     }
     el("cmpTable").innerHTML = '<div class="compare-loading"><span class="spin"></span>loading comparison…</div>';
@@ -1417,18 +1431,25 @@ function initCompare(meta) {
       if (requestId !== compareRequest) return;
       const models = data.models || [];
       if (models.length < 2) {
-        el("cmpTable").innerHTML = '<div class="compare-error">The selected model families could not be compared in this range.</div>';
+        el("cmpTable").innerHTML = '<div class="compare-error">The selected model files could not be compared in this range.</div>';
         return;
       }
-      let html = '<table class="data-table"><tr><th style="width:150px"></th>' + models.map((x) =>
-        '<th><span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span> ' + esc(x.model) + "</th>").join("") + "</tr>";
-      rows.forEach(([label, get, mode]) => {
-        const values = models.map(get); let best = -1, max = null;
-        if (mode === "max") values.forEach((value, i) => {
-          const n = parseFloat(value); if (Number.isFinite(n) && (max == null || n > max)) { max = n; best = i; }
+      let html = '<table class="data-table"><tr><th style="width:150px"></th>' + models.map((x, i) =>
+        '<th><div class="cmp-model-head"><div class="cmp-model-top"><span class="cmp-model-index">0' + (i + 1) +
+        '</span><span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span>' +
+        '<span class="cmp-model-name">' + esc(x.model) + '</span></div><div class="cmp-model-meta">' +
+        esc([x.quant, (x.providers || []).join(" · ")].filter(Boolean).join(" · ") || "observed model file") +
+        "</div></div></th>").join("") + "</tr>";
+      rowGroups.forEach(([group, rows]) => {
+        html += '<tr class="cmp-section-row"><td colspan="' + (models.length + 1) + '">' + esc(group) + "</td></tr>";
+        rows.forEach(([label, get, mode]) => {
+          const values = models.map(get); let best = -1, max = null;
+          if (mode === "max") values.forEach((value, i) => {
+            const n = parseFloat(value); if (Number.isFinite(n) && (max == null || n > max)) { max = n; best = i; }
+          });
+          html += '<tr><td class="muted">' + label + "</td>" + values.map((value, i) =>
+            '<td class="num' + (i === best ? " diff-hl" : "") + '">' + esc(value == null ? "—" : value) + "</td>").join("") + "</tr>";
         });
-        html += '<tr><td class="muted">' + label + "</td>" + values.map((value, i) =>
-          '<td class="num' + (i === best ? " diff-hl" : "") + '">' + esc(value == null ? "—" : value) + "</td>").join("") + "</tr>";
       });
       el("cmpTable").innerHTML = html + "</table>";
       renderDeltas(models);

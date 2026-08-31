@@ -1,7 +1,6 @@
 <div class="page-controls">
   <div class="muted" style="font-size:11px;max-width:640px">
-    Compare up to five observed model families. Files and quants in each family are aggregated
-    over the selected range; nothing is executed.
+    Compare up to five observed model files over the selected range; nothing is executed.
   </div>
   <div style="display:flex;gap:10px;align-items:flex-end">
     <div class="field" style="width:160px;margin:0"><label>Provider</label><select id="cmpProvider"></select></div>
@@ -10,17 +9,24 @@
 </div>
 
 <div class="compare-layout">
-  <div class="panel">
+  <div class="panel compare-candidates">
     <div class="panel-head"><b>Candidates</b><span class="muted" id="cmpCount"></span></div>
     <div class="cmp-pick" id="cmpPick"></div>
   </div>
   <div>
-    <div class="panel compare-result" id="cmpTablePanel">
-      <div id="cmpTable"><div class="empty">select at least two model families to compare</div></div>
+    <div class="compare-output-head">
+      <div><b>File comparison</b><span class="muted"> · selected model files</span></div>
+      <a class="btn small" href="about:blank" data-capture-target="cmpCapture" data-capture-width="1200"
+         aria-label="Capture model comparison as an image">CAPTURE</a>
     </div>
-    <div class="panel" style="margin-top:12px" id="cmpDeltaPanel" hidden>
-      <div class="panel-head"><b>Deltas</b><span class="muted">in selection order</span></div>
-      <div id="cmpDeltas"></div>
+    <div class="panel compare-capture" id="cmpCapture">
+      <div class="compare-result" id="cmpTablePanel">
+        <div id="cmpTable"><div class="empty">select at least two model files to compare</div></div>
+      </div>
+      <div class="compare-deltas" id="cmpDeltaPanel" hidden>
+        <div class="panel-head"><b>Deltas</b><span class="muted">in selection order</span></div>
+        <div id="cmpDeltas"></div>
+      </div>
     </div>
   </div>
 </div>
