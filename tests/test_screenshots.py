@@ -66,9 +66,12 @@ class ScreenshotTests(unittest.TestCase):
             css = source.read()
 
         self.assertIn('id="sidebarToggle"', template)
+        self.assertIn('id="mobileMenu"', template)
+        self.assertIn('id="mobileNavBackdrop"', template)
         self.assertIn('id="themeToggle"', template)
         self.assertIn(':root[data-theme="light"]', css)
         self.assertIn('@media (max-width: 800px)', css)
+        self.assertIn('.mobile-nav-open .sidebar', css)
 
     def test_selected_gauge_capture_preserves_ratio_and_detail_clearance(self):
         css_path = os.path.join(app.BASE_DIR, "static", "css", "app.css")

@@ -15,10 +15,12 @@ window.__onLive = null;
 function initShell() {
   const body = document.body;
   const sidebarToggle = el("sidebarToggle");
-  const themeToggle = el("themeToggle");
+  const mobileMenu = el("mobileMenu");
+  const mobileNavBackdrop = el("mobileNavBackdrop");
+  const themeToggles = [el("themeToggle"), el("mobileThemeToggle")].filter(Boolean);
+  const mobileQuery = matchMedia("(max-width: 800px)");
   const savedSidebar = localStorage.getItem("llm-telemetry-sidebar");
-  const compactViewport = matchMedia("(max-width: 800px)").matches;
-  const collapsed = savedSidebar ? savedSidebar === "collapsed" : compactViewport;
+  const collapsed = savedSidebar === "collapsed";
 
   const setSidebar = (isCollapsed) => {
     body.classList.toggle("sidebar-collapsed", isCollapsed);
@@ -32,23 +34,55 @@ function initShell() {
     requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
   };
   setSidebar(collapsed);
-  if (sidebarToggle) sidebarToggle.onclick = () => setSidebar(!body.classList.contains("sidebar-collapsed"));
+  const setMobileNav = (open) => {
+    body.classList.toggle("mobile-nav-open", open && mobileQuery.matches);
+    if (mobileMenu) {
+      mobileMenu.setAttribute("aria-expanded", String(open && mobileQuery.matches));
+      mobileMenu.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    }
+    if (sidebarToggle && mobileQuery.matches) {
+      sidebarToggle.setAttribute("aria-expanded", String(open));
+      sidebarToggle.title = "Close navigation";
+      const label = sidebarToggle.querySelector("span");
+      if (label) label.textContent = "Close";
+    }
+  };
+  if (sidebarToggle) sidebarToggle.onclick = () => {
+    if (mobileQuery.matches) setMobileNav(false);
+    else setSidebar(!body.classList.contains("sidebar-collapsed"));
+  };
+  if (mobileMenu) mobileMenu.onclick = () => setMobileNav(!body.classList.contains("mobile-nav-open"));
+  if (mobileNavBackdrop) mobileNavBackdrop.onclick = () => setMobileNav(false);
+  document.querySelectorAll(".sidebar nav a").forEach((link) => {
+    link.addEventListener("click", () => setMobileNav(false));
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") setMobileNav(false);
+  });
+  mobileQuery.addEventListener("change", () => {
+    setMobileNav(false);
+    if (!mobileQuery.matches) setSidebar(body.classList.contains("sidebar-collapsed"));
+  });
+  setMobileNav(false);
 
   const syncThemeToggle = () => {
-    if (!themeToggle) return;
     const current = document.documentElement.dataset.theme === "light" ? "light" : "dark";
     const next = current === "light" ? "dark" : "light";
-    themeToggle.setAttribute("aria-label", "Switch to " + next + " mode");
-    themeToggle.title = "Switch to " + next + " mode";
+    themeToggles.forEach((toggle) => {
+      toggle.setAttribute("aria-label", "Switch to " + next + " mode");
+      toggle.title = "Switch to " + next + " mode";
+    });
   };
   syncThemeToggle();
-  if (themeToggle) themeToggle.onclick = () => {
-    const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-    localStorage.setItem("llm-telemetry-theme", next);
-    document.documentElement.dataset.theme = next;
-    syncThemeToggle();
-    location.reload();
-  };
+  themeToggles.forEach((toggle) => {
+    toggle.onclick = () => {
+      const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+      localStorage.setItem("llm-telemetry-theme", next);
+      document.documentElement.dataset.theme = next;
+      syncThemeToggle();
+      location.reload();
+    };
+  });
 
   const captureDialog = el("captureDialog");
   const captureClose = el("captureClose");
@@ -523,6 +557,12 @@ function topbarPill(providers) {
   if (pill && txt) {
     pill.className = pillCls(def.status);
     txt.textContent = name + " · " + (def.status || "OFFLINE");
+  }
+  const mobilePill = el("mobileProvPill");
+  if (mobilePill) {
+    mobilePill.className = "mobile-provider " + (def.status === "LIVE" ? "live" : def.status === "STALE" ? "stale" : "offline");
+    mobilePill.setAttribute("aria-label", name + " · " + (def.status || "OFFLINE"));
+    mobilePill.title = name + " · " + (def.status || "OFFLINE");
   }
   const dot = el("sideDot"), sp = el("sideProv");
   if (dot && sp) {
