@@ -78,7 +78,7 @@ class LlamaClient:
             return {"status": "ok" if r.text.strip() == "ok" else "unknown"}
 
     def metrics(self, model: Optional[str] = None) -> dict[str, float]:
-        """Per-model metrics. A multi-model router may route /metrics?model=<name> to the
+        """Per-model metrics. Nautilus routes /metrics?model=<name> to the
         llama-server spawned for that model; classic servers ignore the param."""
         url = self.base_url + "/metrics"
         if model:
@@ -107,7 +107,7 @@ class LlamaClient:
         return data or []
 
     def slots(self, model: Optional[str] = None) -> list[dict]:
-        """Live per-slot state; multi-model routers may require the model query parameter."""
+        """Live per-slot state; Nautilus requires the model query parameter."""
         url = self.base_url + "/slots"
         if model:
             url += "?model=" + urllib.parse.quote(model)
@@ -125,7 +125,7 @@ class LlamaClient:
 
 
 class AgentClient:
-    """Optional passive host agent (host_agent.py). Read-only."""
+    """Optional passive host agent (nautilus_agent.py). Read-only."""
 
     def __init__(self, base_url: str, timeout: float = 4.0):
         self.base_url = (base_url or "").rstrip("/")
@@ -159,7 +159,7 @@ class FakeClient:
     def __init__(self, snapshot_fn: Callable[[], dict]):
         self._fn = snapshot_fn
         self._last: dict = {}
-        self.base_url = "demo://local-router"
+        self.base_url = "demo://nautilus"
         self.available = {"health": True, "metrics": True, "props": True,
                           "models": True, "slots": True}
 

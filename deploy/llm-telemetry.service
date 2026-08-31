@@ -1,0 +1,24 @@
+[Unit]
+Description=LLM-Telemetry passive llama.cpp dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llm-telemetry
+Group=llm-telemetry
+WorkingDirectory=/opt/llm-telemetry/current
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/llm-telemetry/current/.venv/bin/python /opt/llm-telemetry/current/app.py --host 0.0.0.0 --port 8090 --db /var/lib/llm-telemetry/observatory.db
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/llm-telemetry
+
+[Install]
+WantedBy=multi-user.target

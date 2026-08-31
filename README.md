@@ -29,15 +29,15 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt   # Windows
 # .venv/bin/pip install -r requirements.txt    # Linux/macOS
 
-.venv\Scripts\python app.py            # real mode (default provider: local llama.cpp)
+.venv\Scripts\python app.py            # real mode (default provider: Nautilus)
 .venv\Scripts\python app.py --demo     # demo mode: 30 days of synthetic data, no network
 ```
 
 Open http://127.0.0.1:8090
 
-By default, a provider named **Local llama.cpp** pointing at
-`http://127.0.0.1:8080` (agent `http://127.0.0.1:8091`) is created on
-first start, in every mode. If the server is unreachable the app still starts;
+By default, a provider named **Nautilus** pointing at
+`http://192.168.1.20:8083` (agent `http://192.168.1.20:8091`) is created on
+first start, in every mode. If Nautilus is unreachable the app still starts;
 the provider shows as `STALE` (no data for 20 s) and then `OFFLINE`. Add more
 providers under **Settings → Providers**.
 
@@ -74,8 +74,9 @@ verify the whole pipeline end to end.
 - **Session detail** — TTFT, prompt/gen tokens and speeds, peaks, context
   peak, MTP acceptance, hardware averages, per-second series, the launch
   config that session ran with.
-- **Compare** — line up to five observed model families side by side across a
-  shared range. Files and quants are aggregated; nothing is executed.
+- **Compare** — line up to five specific observed model files side by side
+  across a shared range and export the comparison as a shareable PNG; nothing
+  is executed.
 - **Hardware** — host (CPU/RAM/GPU/driver/PCIe), authoritative llama.cpp build
   version/commit from `/props`, and 1 h per-GPU utilization, VRAM, temperature
   and power series alongside CPU/RAM. Live GPU cards use separate orange VRAM
@@ -113,7 +114,7 @@ hardware and sessions are never pruned. Per-GPU samples follow the same
 
 ## Optional host agent
 
-`host_agent.py` is a stdlib-only passive agent for the inference host
+`nautilus_agent.py` is a stdlib-only passive agent for the inference host
 (Linux). It reports host facts (OS, CPU, RAM, GPUs via `nvidia-smi`, PCIe),
 the llama.cpp build (version/commit/docker image/container from
 `/proc/<pid>/cmdline` and env), and live per-GPU/CPU gauges with stable GPU
@@ -121,7 +122,7 @@ identity — reading only,
 never controlling Docker or the server.
 
 ```bash
-python3 host_agent.py --port 8091 --host 0.0.0.0
+python3 nautilus_agent.py --port 8091 --host 0.0.0.0
 ```
 
 Then set the provider's **Agent URL** to `http://<host>:8091`.
@@ -131,8 +132,22 @@ Then set the provider's **Agent URL** to `http://<host>:8091`.
 FastAPI + Jinja2 + SQLite (SQLModel) + ECharts (vendored, no CDN) + vanilla JS.
 No frontend build step.
 
-## Continuous integration
+## Automated deployment
 
-Pushes and pull requests run the complete Python regression suite on a
-GitHub-hosted runner. This public repository contains no automated deployment
-job and has no connection to a production environment or self-hosted runner.
+Pushes and merges to `main` run the full regression suite and then deploy to an
+Ubuntu LXC through a self-hosted GitHub Actions runner labeled
+`self-hosted,linux,x64,llm-telemetry`. Pull requests run tests without
+deploying.
+
+Bootstrap a new LXC from a repository checkout with:
+
+```bash
+sudo bash deploy/bootstrap-ubuntu.sh "$USER"
+```
+
+The deployment job installs each commit as an isolated release under
+`/opt/llm-telemetry/releases`, atomically switches the active release, and
+restarts the `llm-telemetry` systemd service once. The SQLite database remains
+outside the releases at `/var/lib/llm-telemetry/observatory.db`. A failed
+health check restores and restarts the previous release automatically. The
+service listens on `0.0.0.0:8090` by default.

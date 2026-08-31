@@ -421,8 +421,8 @@ class CollectorLeaseTests(unittest.TestCase):
             self.assertEqual(lease.owner_id, second.owner_id)
 
 
-class ModelFamilyCompareTests(unittest.TestCase):
-    def test_family_compare_uses_weighted_native_durations_and_mixed_config(self):
+class ModelFileCompareTests(unittest.TestCase):
+    def test_file_compare_keeps_model_files_separate(self):
         engine = memory_engine()
         now = int(time.time() * 1000)
         with Session(engine) as session:
@@ -441,6 +441,9 @@ class ModelFamilyCompareTests(unittest.TestCase):
                 session.add(ModelConfig(model_id=model.id, fingerprint=name,
                                         split_mode="tensor" if quant == "Q4_0" else "layer"))
             for model, tokens, seconds in ((models[0], 100, 10), (models[1], 300, 15)):
+                session.add(SessionRow(provider_id=provider.id, model_id=model.id,
+                                       start_at=now - 2500, end_at=now - 500,
+                                       status="COMPLETE"))
                 session.add(TelemetrySample(provider_id=provider.id, model_id=model.id,
                                             ts=now - 2000, state="GENERATING",
                                             gen_total=0, gen_seconds_total=0))
@@ -449,13 +452,31 @@ class ModelFamilyCompareTests(unittest.TestCase):
                                             gen_total=tokens, gen_seconds_total=seconds,
                                             gen_tps=tokens / seconds))
             session.commit()
-            data = metrics.compare_models(session, ["family-a"], None, "7d")
-            item = data["models"][0]
-            self.assertEqual(item["avg_gen_tps"], 16.0)
-            self.assertEqual(item["gen_tokens"], 400)
-            self.assertEqual(item["quants"], ["Q4_0", "Q8_0"])
-            self.assertEqual(item["configuration"], "mixed")
-            self.assertEqual(item["split_mode"], "mixed")
+            candidates = metrics.compare_model_candidates(session, None, "7d")
+            self.assertEqual({row["label"] for row in candidates},
+                             {"family-a-q8", "family-a-q4"})
+            self.assertEqual({row["quant"] for row in candidates}, {"Q8_0", "Q4_0"})
+            self.assertEqual({row["key"] for row in candidates},
+                             {str(models[0].id), str(models[1].id)})
+
+            with patch.object(metrics, "fetch_overview_samples",
+                              wraps=metrics.fetch_overview_samples) as fetch_samples, \
+                    patch.object(metrics, "_gpu_rows",
+                                 wraps=metrics._gpu_rows) as fetch_gpu:
+                data = metrics.compare_models(
+                    session, [str(models[0].id), str(models[1].id)], None, "7d")
+            self.assertEqual(fetch_samples.call_count, 1)
+            self.assertEqual(fetch_gpu.call_count, 1)
+            first, second = data["models"]
+            self.assertEqual(first["model"], "family-a-q4")
+            self.assertEqual(first["avg_gen_tps"], 10.0)
+            self.assertEqual(first["gen_tokens"], 100)
+            self.assertEqual(first["quant"], "Q4_0")
+            self.assertEqual(first["configuration"], "single")
+            self.assertEqual(first["split_mode"], "tensor")
+            self.assertEqual(second["model"], "family-a-q8")
+            self.assertEqual(second["avg_gen_tps"], 20.0)
+            self.assertEqual(second["gen_tokens"], 300)
 
 
 if __name__ == "__main__":

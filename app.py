@@ -1,7 +1,7 @@
 """Observatory - passive llama.cpp observability dashboard.
 
 Run:
-    python app.py            # real mode (reads from a local llama.cpp server by default)
+    python app.py            # real mode (reads from Nautilus by default)
     python app.py --demo     # demo mode (synthetic data, no network)
 """
 from __future__ import annotations
@@ -26,9 +26,8 @@ from observatory import app_state, database as odb, metrics as m
 from observatory.collector import Collector
 from observatory.llama_provider import LlamaClient
 from observatory.models import Provider, Setting, now_ms
-from observatory.settings import (DB_PATH_DEFAULT, DB_PATH_DEMO,
-                                  DEFAULT_PROVIDER_AGENT_URL, DEFAULT_PROVIDER_NAME,
-                                  DEFAULT_PROVIDER_TYPE, DEFAULT_PROVIDER_URL)
+from observatory.settings import (DB_PATH_DEFAULT, DB_PATH_DEMO, NAUTILUS_AGENT_URL,
+                                  NAUTILUS_NAME, NAUTILUS_TYPE, NAUTILUS_URL)
 
 log = logging.getLogger("observatory")
 
@@ -78,13 +77,12 @@ async def _screenshot_cleanup_loop() -> None:
 
 
 def ensure_default_provider():
-    """A safe localhost provider exists from first start, in every mode."""
+    """Nautilus exists from first start, in every mode."""
     with odb.new_session() as s:
-        p = s.exec(select(Provider).where(Provider.name == DEFAULT_PROVIDER_NAME)).first()
+        p = s.exec(select(Provider).where(Provider.name == NAUTILUS_NAME)).first()
         if p is None:
-            p = Provider(name=DEFAULT_PROVIDER_NAME, ptype=DEFAULT_PROVIDER_TYPE,
-                         base_url=DEFAULT_PROVIDER_URL,
-                         agent_url=DEFAULT_PROVIDER_AGENT_URL, enabled=True, is_default=True,
+            p = Provider(name=NAUTILUS_NAME, ptype=NAUTILUS_TYPE, base_url=NAUTILUS_URL,
+                         agent_url=NAUTILUS_AGENT_URL, enabled=True, is_default=True,
                          poll_interval_s=1.0, notes="Default llama.cpp server")
             s.add(p)
             s.commit()
@@ -222,7 +220,7 @@ def create_app(demo: bool = False) -> FastAPI:
     def compare_page(request: Request):
         return templates.TemplateResponse(request, "base.html", {
             "page": "compare", "title": "Compare",
-            "subtitle": "Compare observed model families across the same time range.",
+            "subtitle": "Compare specific model files across the same time range.",
             "nav": NAV, "demo": demo, "query": {}, "template": "compare.html",
         })
 
@@ -310,9 +308,9 @@ def create_app(demo: bool = False) -> FastAPI:
     @app.get("/api/compare/models")
     def api_compare_models(keys: str = "", provider: Optional[int] = None,
                            range: str = "7d"):
-        family_keys = [x for x in keys.split("|") if x]
+        model_keys = [x for x in keys.split("|") if x]
         with odb.new_session() as s:
-            return m.compare_models(s, family_keys, provider, range)
+            return m.compare_models(s, model_keys, provider, range)
 
     @app.get("/api/hardware")
     def api_hardware(provider: Optional[int] = None):

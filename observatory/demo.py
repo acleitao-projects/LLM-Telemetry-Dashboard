@@ -1,6 +1,6 @@
 """Demo mode: a synthetic llama.cpp provider plus 30 days of history.
 
-Demo mode NEVER contacts an external server. It runs the real collector against a
+Demo mode NEVER contacts Nautilus. It runs the real collector against a
 fake client that serves the same read-only interface (health/metrics/
 props/models) with realistic values.
 """
@@ -19,8 +19,8 @@ from . import database as db
 from .llama_provider import FakeClient
 from .models import (BuildInfo, HardwareInfo, Model, ModelConfig, Provider,
                      SessionRow, TelemetrySample, now_ms)
-from .settings import (DEFAULT_PROVIDER_AGENT_URL, DEFAULT_PROVIDER_NAME,
-                       DEFAULT_PROVIDER_TYPE, DEFAULT_PROVIDER_URL)
+from .settings import (NAUTILUS_AGENT_URL, NAUTILUS_NAME, NAUTILUS_TYPE,
+                       NAUTILUS_URL)
 from .metrics import parse_model_name
 
 DAY = 86400.0
@@ -194,7 +194,7 @@ class SimState:
             health = {"status": "loading" if self.phase == "loading" else "ok"}
             props = self._props()
             models = [{"id": self.current.key, "object": "model",
-                       "owned_by": "demo-router"}]
+                       "owned_by": "nautilus"}]
             argv = ["llama-server", "-m", self.current.key,
                     "-c", str(self.current.ctx), "-ngl", "35",
                     "--flash-attn", "--cache-type-k", "q8_0",
@@ -208,7 +208,7 @@ class SimState:
                 "props": props,
                 "models": models,
                 "agent": {
-                    "info": {"hostname": "demo-host",
+                    "info": {"hostname": "nautilus",
                              "os": "Debian GNU/Linux 12 (bookworm)",
                              "kernel": "6.1.0-28-amd64",
                              "cpu_model": "AMD Ryzen 9 7950X",
@@ -294,9 +294,8 @@ class DemoWorld:
         palette = ["#4b8de8", "#d8733e", "#48a77c", "#d29b25", "#8a7bc8", "#4fa3a5"]
         with Session(engine) as s:
             prov = Provider(
-                name=DEFAULT_PROVIDER_NAME, ptype=DEFAULT_PROVIDER_TYPE,
-                base_url=DEFAULT_PROVIDER_URL,
-                agent_url=DEFAULT_PROVIDER_AGENT_URL, enabled=True, is_default=True,
+                name=NAUTILUS_NAME, ptype=NAUTILUS_TYPE, base_url=NAUTILUS_URL,
+                agent_url=NAUTILUS_AGENT_URL, enabled=True, is_default=True,
                 poll_interval_s=1.0, status="LIVE",
                 last_success_at=int(now * 1000), latency_ms=11.0,
             )
@@ -378,7 +377,7 @@ class DemoWorld:
             s.commit()
 
             hw = HardwareInfo(
-                provider_id=prov.id, hostname="demo-host",
+                provider_id=prov.id, hostname="nautilus",
                 os_name="Debian GNU/Linux 12 (bookworm)", kernel="6.1.0-28-amd64",
                 cpu_model="AMD Ryzen 9 7950X", cpu_threads=32, ram_mb=262144,
                 gpus=json.dumps([{"name": "NVIDIA GeForce RTX 4090", "vram_mb": 24564}]),

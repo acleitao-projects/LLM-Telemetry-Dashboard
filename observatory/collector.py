@@ -155,7 +155,7 @@ def _to_int(v):
 def _model_entries(mlist: list) -> list[dict]:
     """Normalize a /v1/models response into per-model entries.
 
-    Multi-model router: every entry carries status.value (loaded/unloaded),
+    Nautilus router: every entry carries status.value (loaded/unloaded),
     status.args (llama-server cmdline) and meta (vocab/params/ftype).
     Classic llama-server / demo: a single entry without status, in which
     case the first entry is the active (loaded) model.
@@ -184,7 +184,7 @@ def _model_entries(mlist: list) -> list[dict]:
 
 
 def model_entry_config(entry: dict) -> dict:
-    """Build a config dict from a router /v1/models entry (args + meta)."""
+    """Build a config dict from a Nautilus /v1/models entry (args + meta)."""
     cfg: dict = {}
     args = entry.get("args") or []
     if args:
@@ -938,7 +938,7 @@ class Collector:
         s.commit()
 
     def _store_router_props(self, s: Session, provider: Provider, props: dict):
-        """Router-level /props: persist build_info as a BuildInfo row."""
+        """Nautilus router-level /props: persist build_info as a BuildInfo row."""
         bi = props.get("build_info")
         if not bi:
             return

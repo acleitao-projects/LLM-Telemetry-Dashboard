@@ -12,6 +12,86 @@ const DETAIL_RANGES = ["1m", "5m", "15m", "1h", "session", "24h", "7d", "30d"];
 window.META = null;
 window.__onLive = null;
 
+function initShell() {
+  const body = document.body;
+  const sidebarToggle = el("sidebarToggle");
+  const mobileMenu = el("mobileMenu");
+  const mobileNavBackdrop = el("mobileNavBackdrop");
+  const themeToggles = [el("themeToggle"), el("mobileThemeToggle")].filter(Boolean);
+  const mobileQuery = matchMedia("(max-width: 800px)");
+  const savedSidebar = localStorage.getItem("llm-telemetry-sidebar");
+  const collapsed = savedSidebar === "collapsed";
+
+  const setSidebar = (isCollapsed) => {
+    body.classList.toggle("sidebar-collapsed", isCollapsed);
+    if (sidebarToggle) {
+      sidebarToggle.setAttribute("aria-expanded", String(!isCollapsed));
+      sidebarToggle.title = isCollapsed ? "Expand sidebar" : "Collapse sidebar";
+      const label = sidebarToggle.querySelector("span");
+      if (label) label.textContent = isCollapsed ? "Expand" : "Collapse";
+    }
+    localStorage.setItem("llm-telemetry-sidebar", isCollapsed ? "collapsed" : "expanded");
+    requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+  };
+  setSidebar(collapsed);
+  const setMobileNav = (open) => {
+    body.classList.toggle("mobile-nav-open", open && mobileQuery.matches);
+    if (mobileMenu) {
+      mobileMenu.setAttribute("aria-expanded", String(open && mobileQuery.matches));
+      mobileMenu.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    }
+    if (sidebarToggle && mobileQuery.matches) {
+      sidebarToggle.setAttribute("aria-expanded", String(open));
+      sidebarToggle.title = "Close navigation";
+      const label = sidebarToggle.querySelector("span");
+      if (label) label.textContent = "Close";
+    }
+  };
+  if (sidebarToggle) sidebarToggle.onclick = () => {
+    if (mobileQuery.matches) setMobileNav(false);
+    else setSidebar(!body.classList.contains("sidebar-collapsed"));
+  };
+  if (mobileMenu) mobileMenu.onclick = () => setMobileNav(!body.classList.contains("mobile-nav-open"));
+  if (mobileNavBackdrop) mobileNavBackdrop.onclick = () => setMobileNav(false);
+  document.querySelectorAll(".sidebar nav a").forEach((link) => {
+    link.addEventListener("click", () => setMobileNav(false));
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") setMobileNav(false);
+  });
+  mobileQuery.addEventListener("change", () => {
+    setMobileNav(false);
+    if (!mobileQuery.matches) setSidebar(body.classList.contains("sidebar-collapsed"));
+  });
+  setMobileNav(false);
+
+  const syncThemeToggle = () => {
+    const current = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+    const next = current === "light" ? "dark" : "light";
+    themeToggles.forEach((toggle) => {
+      toggle.setAttribute("aria-label", "Switch to " + next + " mode");
+      toggle.title = "Switch to " + next + " mode";
+    });
+  };
+  syncThemeToggle();
+  themeToggles.forEach((toggle) => {
+    toggle.onclick = () => {
+      const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+      localStorage.setItem("llm-telemetry-theme", next);
+      document.documentElement.dataset.theme = next;
+      syncThemeToggle();
+      location.reload();
+    };
+  });
+
+  const captureDialog = el("captureDialog");
+  const captureClose = el("captureClose");
+  if (captureClose && captureDialog) captureClose.onclick = () => captureDialog.close();
+  if (captureDialog) captureDialog.onclick = (event) => {
+    if (event.target === captureDialog) captureDialog.close();
+  };
+}
+
 function esc(x) {
   return String(x == null ? "" : x).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -75,10 +155,10 @@ function selMetric(l, v, s) {
     '</div><div class="s">' + esc(s || "") + "</div></div>";
 }
 
-async function capturePanel(target) {
+async function capturePanel(target, includeOverflow = true) {
   if (!target) throw new Error("Capture target is unavailable");
   const rootRect = target.getBoundingClientRect();
-  const captureWidth = Math.ceil(Math.max(target.scrollWidth, rootRect.width));
+  const captureWidth = Math.ceil(includeOverflow ? Math.max(target.scrollWidth, rootRect.width) : rootRect.width);
   const captureHeight = Math.ceil(Math.max(target.scrollHeight, rootRect.height));
   const padding = 1;
   const width = captureWidth + padding * 2;
@@ -283,19 +363,22 @@ async function capturePanelAtWidth(target, width) {
     width: target.style.width,
     minWidth: target.style.minWidth,
     maxWidth: target.style.maxWidth,
+    overflow: target.style.overflow,
   };
   target.style.width = width + "px";
   target.style.minWidth = width + "px";
   target.style.maxWidth = "none";
+  target.style.overflow = "hidden";
   try {
     await afterCaptureLayout();
     window.dispatchEvent(new Event("resize"));
     await afterCaptureLayout();
-    return await capturePanel(target);
+    return await capturePanel(target, false);
   } finally {
     target.style.width = original.width;
     target.style.minWidth = original.minWidth;
     target.style.maxWidth = original.maxWidth;
+    target.style.overflow = original.overflow;
     await afterCaptureLayout();
     window.dispatchEvent(new Event("resize"));
   }
@@ -304,15 +387,12 @@ async function capturePanelAtWidth(target, width) {
 document.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-capture-target]");
   if (!button) return;
+  if (button.classList.contains("is-capturing")) return;
   event.stopPropagation();
   event.preventDefault();
-  const tabName = "telemetry-capture-" + Date.now();
   const captureId = newCaptureId();
-  const waitUrl = "/screenshots/" + captureId + "/wait";
-  button.href = waitUrl;
-  button.target = tabName;
-  const captureTab = window.open(waitUrl, tabName);
   button.classList.add("is-capturing");
+  button.setAttribute("aria-busy", "true");
   try {
     const requestedWidth = Math.max(0, Number(button.dataset.captureWidth) || 0);
     const pngUrl = await capturePanelAtWidth(
@@ -323,11 +403,28 @@ document.addEventListener("click", async (event) => {
       method: "PUT", headers: { "Content-Type": "image/png" }, body: png,
     });
     if (!response.ok) throw new Error(await response.text() || "Screenshot upload failed");
+    const result = await response.json();
+    const imageUrl = result.url || ("/screenshots/" + captureId + ".png");
+    const dialog = el("captureDialog"), preview = el("capturePreview");
+    const open = el("captureOpen"), download = el("captureDownload"), title = el("captureTitle");
+    if (title) title.textContent = "Screenshot ready";
+    if (preview) { preview.hidden = false; preview.src = imageUrl; }
+    if (open) { open.hidden = false; open.href = imageUrl; }
+    if (download) { download.hidden = false; download.href = imageUrl; download.download = "llm-telemetry-" + captureId + ".png"; }
+    if (dialog && typeof dialog.showModal === "function") { if (!dialog.open) dialog.showModal(); }
+    else location.assign(imageUrl);
   } catch (error) {
     console.error("Screenshot capture failed", error);
-    if (captureTab) captureTab.location.replace("/models?capture_error=1");
+    const dialog = el("captureDialog"), preview = el("capturePreview");
+    const open = el("captureOpen"), download = el("captureDownload"), title = el("captureTitle");
+    if (title) title.textContent = "Screenshot failed: " + (error.message || "unknown error");
+    if (preview) preview.hidden = true;
+    if (open) open.hidden = true;
+    if (download) download.hidden = true;
+    if (dialog && typeof dialog.showModal === "function") { if (!dialog.open) dialog.showModal(); }
   } finally {
     button.classList.remove("is-capturing");
+    button.removeAttribute("aria-busy");
   }
 });
 
@@ -463,6 +560,12 @@ function topbarPill(providers) {
   if (pill && txt) {
     pill.className = pillCls(def.status);
     txt.textContent = name + " · " + (def.status || "OFFLINE");
+  }
+  const mobilePill = el("mobileProvPill");
+  if (mobilePill) {
+    mobilePill.className = "mobile-provider " + (def.status === "LIVE" ? "live" : def.status === "STALE" ? "stale" : "offline");
+    mobilePill.setAttribute("aria-label", name + " · " + (def.status || "OFFLINE"));
+    mobilePill.title = name + " · " + (def.status || "OFFLINE");
   }
   const dot = el("sideDot"), sp = el("sideProv");
   if (dot && sp) {
@@ -1223,30 +1326,42 @@ function initSessionDetail(meta) {
 function initCompare(meta) {
   const providers = (meta && meta.providers) || [];
   const st = { range: "7d", provider: "", selected: [], candidates: [] };
-  const rows = [
-    ["Variants", (x) => (x.variants || []).join(" · ") || "—"],
-    ["Quants", (x) => (x.quants || []).join(" · ") || "—"],
-    ["Providers", (x) => (x.providers || []).join(" · ") || "—"],
-    ["Total tokens", (x) => fmtTokens(x.tokens)],
-    ["Prompt tokens", (x) => fmtTokens(x.prompt_tokens)],
-    ["Generated tokens", (x) => fmtTokens(x.gen_tokens)],
-    ["Avg prompt t/s", (x) => x.prompt_tps, "max"],
-    ["Peak prompt t/s", (x) => x.peak_prompt_tps, "max"],
-    ["Avg gen t/s", (x) => x.avg_gen_tps, "max"],
-    ["Peak gen t/s", (x) => x.peak_gen_tps, "max"],
-    ["Inference time", (x) => fmtDur(x.inference_s)],
-    ["Loaded / idle", (x) => fmtDur(x.loaded_s) + " / " + fmtDur(x.idle_s)],
-    ["Utilization", (x) => x.utilization != null ? x.utilization + "%" : "—", "max"],
-    ["Context max", (x) => x.context_max ? fmtNum(x.context_max) : "—"],
-    ["MTP acceptance", (x) => x.mtp_acc != null ? x.mtp_acc + "%" : "—", "max"],
-    ["MTP drafts", (x) => x.mtp_proposed ? fmtTokens(x.mtp_accepted) + " accepted / " + fmtTokens(x.mtp_rejected) + " rejected" : "—"],
-    ["Configuration", (x) => x.configuration || "—"],
-    ["KV cache", (x) => x.kv_cache || "—"],
-    ["Split / reasoning", (x) => (x.split_mode || "—") + " / " + (x.reasoning_effort || "—")],
-    ["Per-GPU averages", (x) => (x.gpus || []).map((g) => "GPU " + g.index + ": " +
-      (g.summary.util != null ? g.summary.util + "%" : "—") + " / " +
-      (g.summary.vram_mb != null ? fmtBytes(g.summary.vram_mb * 1024 * 1024) : "—")).join(" · ") || "—"],
-    ["Build", (x) => x.build || "—"],
+  const rowGroups = [
+    ["Model file", [
+      ["Family", (x) => x.family || "—"],
+      ["Quant", (x) => x.quant || "—"],
+      ["Provider", (x) => (x.providers || []).join(" · ") || "—"],
+    ]],
+    ["Tokens", [
+      ["Total tokens", (x) => fmtTokens(x.tokens)],
+      ["Prompt tokens", (x) => fmtTokens(x.prompt_tokens)],
+      ["Generated tokens", (x) => fmtTokens(x.gen_tokens)],
+    ]],
+    ["Throughput", [
+      ["Avg prompt t/s", (x) => x.prompt_tps, "max"],
+      ["Peak prompt t/s", (x) => x.peak_prompt_tps, "max"],
+      ["Avg gen t/s", (x) => x.avg_gen_tps, "max"],
+      ["Peak gen t/s", (x) => x.peak_gen_tps, "max"],
+    ]],
+    ["Runtime", [
+      ["Inference time", (x) => fmtDur(x.inference_s)],
+      ["Loaded / idle", (x) => fmtDur(x.loaded_s) + " / " + fmtDur(x.idle_s)],
+      ["Utilization", (x) => x.utilization != null ? x.utilization + "%" : "—", "max"],
+      ["Context max", (x) => x.context_max ? fmtNum(x.context_max) : "—"],
+    ]],
+    ["MTP", [
+      ["MTP acceptance", (x) => x.mtp_acc != null ? x.mtp_acc + "%" : "—", "max"],
+      ["MTP drafts", (x) => x.mtp_proposed ? fmtTokens(x.mtp_accepted) + " accepted / " + fmtTokens(x.mtp_rejected) + " rejected" : "—"],
+    ]],
+    ["Configuration", [
+      ["Configuration", (x) => x.configuration || "—"],
+      ["KV cache", (x) => x.kv_cache || "—"],
+      ["Split / reasoning", (x) => (x.split_mode || "—") + " / " + (x.reasoning_effort || "—")],
+      ["Per-GPU averages", (x) => (x.gpus || []).map((g) => "GPU " + g.index + ": " +
+        (g.summary.util != null ? g.summary.util + "%" : "—") + " / " +
+        (g.summary.vram_mb != null ? fmtBytes(g.summary.vram_mb * 1024 * 1024) : "—")).join(" · ") || "—"],
+      ["Build", (x) => x.build || "—"],
+    ]],
   ];
 
   const query = (path, includeKeys) => {
@@ -1261,9 +1376,11 @@ function initCompare(meta) {
       '<label class="cmp-row"><input type="checkbox" data-idx="' + i + '"' +
       (st.selected.includes(x.key) ? " checked" : "") + ">" +
       '<span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span>' +
-      '<span>' + esc(x.label) + '</span><span class="muted" style="margin-left:auto">' +
-      (x.gen_tps != null ? x.gen_tps + " t/s" : fmtTokens(x.tokens)) + "</span></label>").join("") :
-      '<div class="empty">no model-family activity in this range</div>';
+      '<span class="cmp-pick-name">' + esc(x.label) + '<small class="cmp-pick-meta">' +
+      esc([x.quant, x.provider].filter(Boolean).join(" · ") || x.family || "model file") + '</small></span>' +
+      '<span class="cmp-pick-stat">' + (x.gen_tps != null ? x.gen_tps + " t/s" : fmtTokens(x.tokens)) +
+      '<small>' + fmtTokens(x.tokens) + " · " + (x.share || 0) + "%</small></span></label>").join("") :
+      '<div class="empty">no model-file activity in this range</div>';
     el("cmpPick").querySelectorAll("input").forEach((input) => {
       input.onchange = () => {
         const key = st.candidates[Number(input.dataset.idx)].key;
@@ -1275,33 +1392,93 @@ function initCompare(meta) {
       };
     });
   };
+  let compareRequest = 0;
+  const renderDeltas = (models) => {
+    const panel = el("cmpDeltaPanel"), box = el("cmpDeltas");
+    if (!panel || !box || models.length < 2) { if (panel) panel.hidden = true; return; }
+    const metrics = [
+      ["Generated tokens", "gen_tokens", (value) => fmtTokens(value)],
+      ["Avg gen t/s", "avg_gen_tps", (value) => value == null ? "—" : value + " t/s"],
+      ["Inference time", "inference_s", (value) => fmtDur(value)],
+      ["Utilization", "utilization", (value) => value == null ? "—" : value + "%"],
+    ];
+    let html = '<div class="table-scroll"><table class="data-table"><tr><th>Change</th>' +
+      metrics.map(([label]) => "<th>" + esc(label) + "</th>").join("") + "</tr>";
+    for (let index = 1; index < models.length; index += 1) {
+      const before = models[index - 1], after = models[index];
+      html += "<tr><td>" + esc(before.model) + " → " + esc(after.model) + "</td>";
+      metrics.forEach(([, key, format]) => {
+        const a = Number(before[key]), b = Number(after[key]);
+        const pct = Number.isFinite(a) && Number.isFinite(b) && a !== 0 ? (b - a) / Math.abs(a) * 100 : null;
+        const cls = pct == null || pct === 0 ? "" : pct > 0 ? " cmp-delta-up" : " cmp-delta-down";
+        html += '<td class="num' + cls + '">' + esc(format(after[key])) +
+          (pct == null ? "" : " (" + (pct > 0 ? "+" : "") + pct.toFixed(1) + "%)") + "</td>";
+      });
+      html += "</tr>";
+    }
+    box.innerHTML = html + "</table></div>";
+    panel.hidden = false;
+  };
   const loadCompare = () => {
+    const requestId = ++compareRequest;
     el("cmpDeltaPanel").hidden = true;
     if (st.selected.length < 2) {
-      el("cmpTable").innerHTML = '<div class="empty">select at least two model families to compare</div>';
+      el("cmpTable").innerHTML = '<div class="empty">select at least two model files to compare</div>';
       return;
     }
+    el("cmpTable").innerHTML = '<div class="compare-loading"><span class="spin"></span>loading comparison…</div>';
     api(query("/api/compare/models", true)).then((data) => {
+      if (requestId !== compareRequest) return;
       const models = data.models || [];
-      let html = '<table class="data-table"><tr><th style="width:150px"></th>' + models.map((x) =>
-        '<th><span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span> ' + esc(x.model) + "</th>").join("") + "</tr>";
-      rows.forEach(([label, get, mode]) => {
-        const values = models.map(get); let best = -1, max = null;
-        if (mode === "max") values.forEach((value, i) => {
-          const n = parseFloat(value); if (Number.isFinite(n) && (max == null || n > max)) { max = n; best = i; }
+      if (models.length < 2) {
+        el("cmpTable").innerHTML = '<div class="compare-error">The selected model files could not be compared in this range.</div>';
+        return;
+      }
+      let html = '<div class="cmp-model-header" style="--model-count:' + models.length + '">' + models.map((x, i) =>
+        '<div class="cmp-model-head"><div class="cmp-model-top"><span class="cmp-model-index">0' + (i + 1) +
+        '</span><span class="m-dot" style="background:' + esc(x.color || "#74736e") + '"></span>' +
+        '<span class="cmp-model-name">' + esc(x.model) + '</span></div><div class="cmp-model-meta">' +
+        esc([x.quant, (x.providers || []).join(" · ")].filter(Boolean).join(" · ") || "observed model file") +
+        "</div></div>").join("") + '</div><table class="data-table">';
+      rowGroups.forEach(([group, rows]) => {
+        html += '<tr class="cmp-section-row"><td colspan="' + (models.length + 1) + '">' + esc(group) + "</td></tr>";
+        rows.forEach(([label, get, mode]) => {
+          const values = models.map(get); let best = -1, max = null;
+          if (mode === "max") values.forEach((value, i) => {
+            const n = parseFloat(value); if (Number.isFinite(n) && (max == null || n > max)) { max = n; best = i; }
+          });
+          html += '<tr><td class="muted">' + label + "</td>" + values.map((value, i) =>
+            '<td class="num' + (i === best ? " diff-hl" : "") + '">' + esc(value == null ? "—" : value) + "</td>").join("") + "</tr>";
         });
-        html += '<tr><td class="muted">' + label + "</td>" + values.map((value, i) =>
-          '<td class="num' + (i === best ? " diff-hl" : "") + '">' + esc(value == null ? "—" : value) + "</td>").join("") + "</tr>";
       });
       el("cmpTable").innerHTML = html + "</table>";
+      renderDeltas(models);
+    }).catch((error) => {
+      if (requestId !== compareRequest) return;
+      console.error("compare", error);
+      el("cmpTable").innerHTML = '<div class="compare-error">Comparison failed to load. Please try again.</div>';
     });
   };
-  const loadCandidates = () => api(query("/api/compare/models/candidates", false)).then((data) => {
-    st.candidates = data.models || [];
-    const available = new Set(st.candidates.map((x) => x.key));
-    st.selected = st.selected.filter((key) => available.has(key));
-    renderPick(); loadCompare();
-  });
+  let candidateRequest = 0;
+  const loadCandidates = () => {
+    const requestId = ++candidateRequest;
+    el("cmpPick").innerHTML = '<div class="compare-loading"><span class="spin"></span>loading models…</div>';
+    return api(query("/api/compare/models/candidates", false)).then((data) => {
+      if (requestId !== candidateRequest) return;
+      st.candidates = data.models || [];
+      const available = new Set(st.candidates.map((x) => x.key));
+      st.selected = st.selected.filter((key) => available.has(key));
+      renderPick(); loadCompare();
+    }).catch((error) => {
+      if (requestId !== candidateRequest) return;
+      console.error("compare candidates", error);
+      st.candidates = [];
+      st.selected = [];
+      el("cmpCount").textContent = "unavailable";
+      el("cmpPick").innerHTML = '<div class="compare-error">Models failed to load. Please try again.</div>';
+      el("cmpTable").innerHTML = '<div class="empty">comparison unavailable</div>';
+    });
+  };
   fillSelect(el("cmpProvider"), "All providers", providers.map((p) => [p.id, p.name]), st.provider);
   el("cmpProvider").onchange = (event) => { st.provider = event.target.value; loadCandidates(); };
   segControl("cmpRange", RANGES.map((r) => RANGE_LABELS[r]), RANGE_LABELS[st.range], (label) => {
@@ -1573,7 +1750,10 @@ function initSettings(meta) {
     fetch("/api/settings/display", {
       method: "PUT", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ default_range: r.value, default_group: g.value, theme: t.value }),
-    }).then((x) => x.json()).then(() => { location.reload(); });
+    }).then((x) => x.json()).then(() => {
+      localStorage.setItem("llm-telemetry-theme", t.value);
+      location.reload();
+    });
   };
 
   loadAll().then(([st, provs, disp]) => {
@@ -1584,4 +1764,4 @@ function initSettings(meta) {
   return Promise.resolve();
 }
 
-document.addEventListener("DOMContentLoaded", bootstrap);
+document.addEventListener("DOMContentLoaded", () => { initShell(); bootstrap(); });

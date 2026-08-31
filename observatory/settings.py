@@ -6,12 +6,12 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8090
 
 # ---------------------------------------------------------------------------
-# Safe local default provider
+# Default provider: Nautilus
 # ---------------------------------------------------------------------------
-DEFAULT_PROVIDER_NAME = "Local llama.cpp"
-DEFAULT_PROVIDER_TYPE = "llama.cpp"
-DEFAULT_PROVIDER_URL = "http://127.0.0.1:8080"
-DEFAULT_PROVIDER_AGENT_URL = "http://127.0.0.1:8091"
+NAUTILUS_NAME = "Nautilus"
+NAUTILUS_TYPE = "llama.cpp"
+NAUTILUS_URL = "http://192.168.1.20:8083"
+NAUTILUS_AGENT_URL = "http://192.168.1.20:8091"
 
 # ---------------------------------------------------------------------------
 # Collection cadence
@@ -44,7 +44,7 @@ BUCKET_FULL_S = 60.0            # old-resolution bucket size
 MODEL_COLORS = ["#4b8de8", "#d8733e", "#48a77c", "#d29b25", "#8a7bc8", "#4fa3a5"]
 
 # known llama.cpp prometheus metric names (first match wins).
-# `llama_server_*` = classic per-server build; `llamacpp:*` = multi-model router
+# `llama_server_*` = classic per-server build; `llamacpp:*` = Nautilus router
 # (per-model /metrics?model=<name> on the spawned llama-server).
 METRIC_ALIASES = {
     "tokens_total": ("llama_server_tokens_total", "llamacpp:tokens_total"),

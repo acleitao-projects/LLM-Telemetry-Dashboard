@@ -10,7 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
-import host_agent
+import nautilus_agent
 from observatory import database, metrics
 from observatory.collector import Collector, _bucketize_gpu
 from observatory.models import (BuildInfo, GpuTelemetrySample, HardwareInfo,
@@ -75,9 +75,9 @@ class GpuCollectionTests(unittest.TestCase):
         output = ("0, GPU-aaa, NVIDIA RTX 3060, 12288, 6000, 12, 52, 170, 40, 3, 16, 580.1\n"
                   "1, GPU-bbb, NVIDIA RTX 3060, 12288, 7000, 22, 48, 170, 35, 3, 16, 580.1\n")
         result = SimpleNamespace(returncode=0, stdout=output)
-        with patch("host_agent.shutil.which", return_value="nvidia-smi"), \
-                patch("host_agent.subprocess.run", return_value=result):
-            payload = host_agent.gpu_info()
+        with patch("nautilus_agent.shutil.which", return_value="nvidia-smi"), \
+                patch("nautilus_agent.subprocess.run", return_value=result):
+            payload = nautilus_agent.gpu_info()
         self.assertEqual([(gpu["index"], gpu["uuid"]) for gpu in payload["gpus"]],
                          [(0, "GPU-aaa"), (1, "GPU-bbb")])
 
