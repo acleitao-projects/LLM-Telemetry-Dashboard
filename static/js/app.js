@@ -155,10 +155,10 @@ function selMetric(l, v, s) {
     '</div><div class="s">' + esc(s || "") + "</div></div>";
 }
 
-async function capturePanel(target) {
+async function capturePanel(target, includeOverflow = true) {
   if (!target) throw new Error("Capture target is unavailable");
   const rootRect = target.getBoundingClientRect();
-  const captureWidth = Math.ceil(Math.max(target.scrollWidth, rootRect.width));
+  const captureWidth = Math.ceil(includeOverflow ? Math.max(target.scrollWidth, rootRect.width) : rootRect.width);
   const captureHeight = Math.ceil(Math.max(target.scrollHeight, rootRect.height));
   const padding = 1;
   const width = captureWidth + padding * 2;
@@ -363,19 +363,22 @@ async function capturePanelAtWidth(target, width) {
     width: target.style.width,
     minWidth: target.style.minWidth,
     maxWidth: target.style.maxWidth,
+    overflow: target.style.overflow,
   };
   target.style.width = width + "px";
   target.style.minWidth = width + "px";
   target.style.maxWidth = "none";
+  target.style.overflow = "hidden";
   try {
     await afterCaptureLayout();
     window.dispatchEvent(new Event("resize"));
     await afterCaptureLayout();
-    return await capturePanel(target);
+    return await capturePanel(target, false);
   } finally {
     target.style.width = original.width;
     target.style.minWidth = original.minWidth;
     target.style.maxWidth = original.maxWidth;
+    target.style.overflow = original.overflow;
     await afterCaptureLayout();
     window.dispatchEvent(new Event("resize"));
   }

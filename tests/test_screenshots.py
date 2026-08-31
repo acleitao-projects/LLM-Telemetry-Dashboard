@@ -34,6 +34,8 @@ class ScreenshotTests(unittest.TestCase):
 
         self.assertIn('data-capture-width="600"', script)
         self.assertIn("capturePanelAtWidth", script)
+        self.assertIn("capturePanel(target, false)", script)
+        self.assertIn('target.style.overflow = "hidden"', script)
 
     def test_capture_uuid_has_plain_http_fallback(self):
         script_path = os.path.join(app.BASE_DIR, "static", "js", "app.js")
