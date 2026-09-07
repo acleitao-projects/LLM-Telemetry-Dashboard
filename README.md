@@ -3,7 +3,7 @@
 > Passive observability dashboard for llama.cpp servers — read-only telemetry, no prompts, no inference control.
 
 [![License: 0BSD](https://img.shields.io/badge/License-0BSD-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green.svg)](https://fastapi.tiangolo.com/)
 
 ## What is this?
