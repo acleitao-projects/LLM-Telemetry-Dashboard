@@ -1,139 +1,22 @@
-/* Observatory - ECharts theme + helpers */
+/* Observatory - shared helpers: theme colors, formatters, deduplicated api,
+   segment controls. Loaded on every page. Chart-specific option builders and
+   the shared chart lifecycle registry live in chart-runtime.js and load only
+   on pages that create charts. */
 "use strict";
 
+const LIGHT_THEME = document.documentElement.dataset.theme === "light";
 const OC = {
   bg: "transparent",
-  border: "#2a2a27",
-  split: "#21211e",
-  axis: "#343431",
-  label: "#74736e",
-  text: "#a6a49d",
-  blue: "#4b8de8",
-  orange: "#d8733e",
-  green: "#48a77c",
-  amber: "#d29b25",
+  border: LIGHT_THEME ? "#d5d8dc" : "#2a2a27",
+  split: LIGHT_THEME ? "#e3e5e8" : "#21211e",
+  axis: LIGHT_THEME ? "#b8bdc4" : "#343431",
+  label: LIGHT_THEME ? "#747b84" : "#74736e",
+  text: LIGHT_THEME ? "#4e545b" : "#a6a49d",
+  blue: LIGHT_THEME ? "#245fb5" : "#4b8de8",
+  orange: LIGHT_THEME ? "#b74f1f" : "#d8733e",
+  green: LIGHT_THEME ? "#287a54" : "#48a77c",
+  amber: LIGHT_THEME ? "#956814" : "#d29b25",
 };
-
-function baseOption() {
-  return {
-    backgroundColor: OC.bg,
-    grid: { left: 40, right: 10, top: 12, bottom: 22 },
-    tooltip: {
-      trigger: "axis",
-      backgroundColor: "#1e1e1b",
-      borderColor: OC.border,
-      borderWidth: 1,
-      padding: [6, 10],
-      textStyle: { color: OC.text, fontSize: 11 },
-      axisPointer: { lineStyle: { color: OC.border } },
-    },
-    xAxis: {
-      type: "category",
-      axisLine: { lineStyle: { color: OC.axis } },
-      axisTick: { show: false },
-      axisLabel: { color: OC.label, fontSize: 9.5, hideOverlap: true },
-    },
-    yAxis: {
-      type: "value",
-      splitLine: { lineStyle: { color: OC.split } },
-      axisLabel: { color: OC.label, fontSize: 9.5 },
-      axisLine: { show: false },
-    },
-  };
-}
-
-function lineOption(labels, series) {
-  // series: [{name, color, data, area?}]
-  const o = baseOption();
-  o.xAxis.data = labels;
-  o.series = series.map((s, i) => ({
-    name: s.name,
-    type: "line",
-    data: s.data,
-    showSymbol: false,
-    smooth: 0.15,
-    connectNulls: false,
-    lineStyle: { width: 1, color: s.color },
-    itemStyle: { color: s.color },
-    areaStyle: s.area ? { color: s.color + "22" } : undefined,
-    emphasis: { focus: "series" },
-    z: 10 - i,
-  }));
-  o.legend = series.length > 1 ? {
-    top: 0, right: 0, itemWidth: 8, itemHeight: 6,
-    textStyle: { color: OC.label, fontSize: 9.5 },
-  } : undefined;
-  if (o.legend) o.grid.top = 22;
-  o.tooltip.valueFormatter = (v) => (v == null ? "-" : v);
-  return o;
-}
-
-function areaStackOption(labels, series, unit) {
-  const o = baseOption();
-  o.xAxis.data = labels;
-  o.series = series.map((s) => ({
-    name: s.name, type: "line", stack: "tok", data: s.data,
-    showSymbol: false, smooth: 0.1, lineStyle: { width: 1, color: s.color },
-    itemStyle: { color: s.color },
-    areaStyle: { color: s.color + "30" },
-    emphasis: { focus: "series" },
-  }));
-  o.legend = { top: 0, right: 0, itemWidth: 8, itemHeight: 6,
-    textStyle: { color: OC.label, fontSize: 9.5 } };
-  o.grid.top = 22;
-  return o;
-}
-
-function barOption(labels, series, opts = {}) {
-  const o = baseOption();
-  o.xAxis.data = labels;
-  o.series = series.map((s) => ({
-    name: s.name, type: "bar", data: s.data,
-    barMaxWidth: 26,
-    itemStyle: { color: s.color || OC.blue, borderRadius: [2, 2, 0, 0] },
-  }));
-  if (opts.horizontal) {
-    o.xAxis = { type: "value", splitLine: { lineStyle: { color: OC.split } },
-      axisLabel: { color: OC.label, fontSize: 9.5 }, axisLine: { show: false } };
-    o.yAxis = { type: "category", data: labels,
-      axisLabel: { color: OC.text, fontSize: 10 }, axisLine: { show: false },
-      axisTick: { show: false } };
-    o.grid = { left: 110, right: 30, top: 6, bottom: 18 };
-    o.series = series.map((s) => ({
-      name: s.name, type: "bar", data: s.data, barMaxWidth: 14,
-      itemStyle: { color: s.color || OC.blue, borderRadius: [0, 2, 2, 0] },
-    }));
-  }
-  return o;
-}
-
-function sparkline(el, data, color, area = true) {
-  if (!el || typeof echarts === "undefined") return null;
-  const ch = echarts.init(el, null, { renderer: "canvas" });
-  ch.setOption({
-    backgroundColor: OC.bg,
-    grid: { left: 0, right: 0, top: 2, bottom: 0 },
-    xAxis: { type: "category", show: false, data: data.map((_, i) => i) },
-    yAxis: { type: "value", show: false },
-    series: [{
-      type: "line", data, showSymbol: false, smooth: 0.2,
-      lineStyle: { width: 1, color },
-      itemStyle: { color },
-      areaStyle: area ? { color: color + "26" } : undefined,
-    }],
-    tooltip: { show: false },
-  });
-  return ch;
-}
-
-function registerChart(el, option) {
-  if (!el || typeof echarts === "undefined") return null;
-  const ch = echarts.init(el, null, { renderer: "canvas" });
-  ch.setOption(option);
-  window.__charts = window.__charts || [];
-  window.__charts.push(ch);
-  return ch;
-}
 
 function fmtTokens(n) {
   if (n == null || isNaN(n)) return "-";
@@ -199,11 +82,16 @@ function fmtAgo(ms, now) {
 
 function el(id) { return document.getElementById(id); }
 
+const _apiInflight = new Map();
 function api(path) {
-  return fetch(path).then((r) => {
+  const existing = _apiInflight.get(path);
+  if (existing) return existing;
+  const p = fetch(path).then((r) => {
     if (!r.ok) throw new Error("HTTP " + r.status);
     return r.json();
-  });
+  }).finally(() => { _apiInflight.delete(path); });
+  _apiInflight.set(path, p);
+  return p;
 }
 
 function segControl(containerId, options, active, onPick) {

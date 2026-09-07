@@ -1,4 +1,4 @@
-"""Passive, read-only client for llama.cpp server endpoints.
+"""llama.cpp client for telemetry plus explicitly requested model administration.
 
 Observatory NEVER sends prompts. The only endpoints ever touched are:
     GET /health
@@ -6,6 +6,16 @@ Observatory NEVER sends prompts. The only endpoints ever touched are:
     GET /props
     GET /v1/models
     GET /slots
+
+The only mutating call is POST /models/unload, used by the dashboard after an
+operator explicitly confirms the global unload action.
+
+One documented exception exists: when the operator opts in to inference-assisted
+name matching for automatic pricing (Settings -> Automatic Pricing, default OFF),
+``observatory.pricing_sync`` sends a single short ``POST /v1/chat/completions``
+to a configured, LIVE, >=30-min-idle provider, against a model that is already
+loaded. It never loads a model and the reply only selects a pricing-catalog key
+-- never a price. See ``observatory/pricing_sync.py``.
 """
 from __future__ import annotations
 
@@ -59,7 +69,7 @@ def map_metrics(raw: dict[str, float]) -> dict[str, Any]:
 
 
 class LlamaClient:
-    """Synchronous read-only llama.cpp client. One instance per provider."""
+    """Synchronous llama.cpp client. One instance per provider."""
 
     def __init__(self, base_url: str, timeout: float = 4.0):
         self.base_url = (base_url or "").rstrip("/")
@@ -78,7 +88,7 @@ class LlamaClient:
             return {"status": "ok" if r.text.strip() == "ok" else "unknown"}
 
     def metrics(self, model: Optional[str] = None) -> dict[str, float]:
-        """Per-model metrics. A multi-model router may route /metrics?model=<name> to the
+        """Per-model metrics. A multi-model router routes /metrics?model=<name> to the
         llama-server spawned for that model; classic servers ignore the param."""
         url = self.base_url + "/metrics"
         if model:
@@ -107,7 +117,7 @@ class LlamaClient:
         return data or []
 
     def slots(self, model: Optional[str] = None) -> list[dict]:
-        """Live per-slot state; multi-model routers may require the model query parameter."""
+        """Live per-slot state; a multi-model router requires the model query parameter."""
         url = self.base_url + "/slots"
         if model:
             url += "?model=" + urllib.parse.quote(model)
@@ -116,6 +126,18 @@ class LlamaClient:
         self.available["slots"] = True
         data = r.json()
         return data if isinstance(data, list) else []
+
+    def unload(self, model: str) -> dict:
+        """Explicitly unload one router model after user confirmation."""
+        r = self._c.post(self.base_url + "/models/unload", json={"model": model})
+        r.raise_for_status()
+        try:
+            data = r.json()
+        except ValueError:
+            return {}
+        if isinstance(data, dict) and data.get("success") is False:
+            raise LlamaError(data.get("error") or "model unload was rejected")
+        return data if isinstance(data, dict) else {}
 
     def close(self):
         try:
@@ -181,6 +203,9 @@ class FakeClient:
 
     def slots(self, model: Optional[str] = None) -> list[dict]:
         return self._snap().get("slots", [])
+
+    def unload(self, model: str) -> dict:
+        return {"success": True, "model": model}
 
     def agent_snapshot(self) -> dict:
         self._snap()

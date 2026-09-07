@@ -6,10 +6,12 @@ from unittest.mock import patch
 
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
+from fastapi.testclient import TestClient
 
 import app
+from observatory import metrics
 from observatory.collector import Collector
-from observatory.models import Provider
+from observatory.models import Model, Provider, SessionRow
 
 
 def memory_engine():
@@ -85,6 +87,56 @@ class ProviderSettingsTests(unittest.TestCase):
         self.assertEqual(sum(url.endswith("/v1/models") for url, _ in calls), 1)
 
 
+class UnloadModelsTests(unittest.TestCase):
+    def test_unloads_each_loaded_model_and_ignores_unloaded_entries(self):
+        calls = []
+
+        class Client:
+            def __init__(self, base_url, timeout):
+                self.base_url = base_url
+
+            def models(self):
+                return [
+                    {"id": "cold", "status": {"value": "unloaded"}},
+                    {"id": "hot-a", "status": {"value": "loaded"}},
+                    {"name": "hot-b", "status": {"value": "loaded"}},
+                ]
+
+            def unload(self, model):
+                calls.append(model)
+                return {"success": True}
+
+            def close(self):
+                calls.append("closed")
+
+        with patch("app.LlamaClient", Client):
+            result = app._unload_provider_models(Provider(
+                id=4, name="router", base_url="http://router"))
+
+        self.assertEqual(result["status"], "unloaded")
+        self.assertEqual(result["models"], ["hot-a", "hot-b"])
+        self.assertEqual(calls, ["hot-a", "hot-b", "closed"])
+
+    def test_provider_failure_is_reported_without_raising(self):
+        class Client:
+            def __init__(self, base_url, timeout):
+                pass
+
+            def models(self):
+                raise RuntimeError("connection refused")
+
+            def close(self):
+                pass
+
+        with patch("app.LlamaClient", Client):
+            result = app._unload_provider_models(Provider(
+                id=5, name="offline", base_url="http://offline"))
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["models"], [])
+        self.assertIn("connection refused", result["error"])
+
+
 class FailingMetricsClient:
     base_url = "http://router"
 
@@ -146,6 +198,68 @@ class CollectorFailureTests(unittest.TestCase):
             self.assertEqual(provider.status, "OFFLINE")
             self.assertEqual(provider.fail_streak, 1)
             self.assertIn("metrics failed for model-a", provider.last_error)
+
+
+class StatusNoOutboundTests(unittest.TestCase):
+    def test_status_does_not_make_outbound_httpx_calls(self):
+        engine = memory_engine()
+        with Session(engine) as session:
+            session.add(Provider(name="router", base_url="http://router",
+                                 agent_url="http://agent", status="LIVE"))
+            session.commit()
+        with patch("httpx.get") as mock_get:
+            with Session(engine) as session:
+                data = metrics.status(session)
+            mock_get.assert_not_called()
+        self.assertEqual(data["providers"][0]["agent_status"], "LIVE")
+
+    def test_status_agent_offline_when_provider_not_live(self):
+        engine = memory_engine()
+        with Session(engine) as session:
+            session.add(Provider(name="router", base_url="http://router",
+                                  agent_url="http://agent", status="OFFLINE"))
+            session.commit()
+        with Session(engine) as session:
+            data = metrics.status(session)
+        self.assertEqual(data["providers"][0]["agent_status"], "OFFLINE")
+
+
+class CacheLockTests(unittest.TestCase):
+    def test_models_endpoint_no_deadlock_on_nested_key_lock(self):
+        """cached_models_payload acquires _key_lock(key) then calls
+        cached_range_summary which acquires _key_lock(same_key).
+        A non-reentrant Lock deadlocks; RLock allows re-entry."""
+        engine = memory_engine()
+        with Session(engine) as s:
+            s.add(Provider(name="router", base_url="http://router"))
+            s.commit()
+        with patch("observatory.database._engine", engine), \
+             patch("observatory.database._db_path", "test.db"):
+            with TestClient(app.create_app(demo=True)) as client:
+                resp = client.get("/api/models?range=7d")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("rows", resp.json())
+
+
+class SelectedStatsMissingProviderTests(unittest.TestCase):
+    """selected_stats must not 500 when a Model references a deleted Provider."""
+
+    def test_selected_stats_survives_missing_provider(self):
+        engine = memory_engine()
+        with Session(engine) as s:
+            s.add(Provider(name="alive", base_url="http://alive"))
+            orphan = Model(provider_id=999, key="orphan", name="Orphan-Model",
+                           color="#fff", first_seen_at=0)
+            s.add(orphan)
+            s.commit()
+            s.refresh(orphan)
+            model_id = orphan.id
+        with Session(engine) as s:
+            summary = metrics.range_summary(s, None, "7d")
+            result = metrics.selected_stats(s, [model_id], None, "7d", summary, None)
+        self.assertIsInstance(result, dict)
+        self.assertIsNone(result["provider"])
+        self.assertEqual(result["label"], "Orphan-Model")
 
 
 if __name__ == "__main__":

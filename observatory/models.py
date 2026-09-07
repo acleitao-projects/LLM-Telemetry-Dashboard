@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from sqlalchemy import Index, UniqueConstraint
+from sqlalchemy import Index, UniqueConstraint, desc, text
 from sqlmodel import Field, SQLModel
 
 
@@ -42,8 +42,25 @@ class Model(SQLModel, table=True):
     color: str = "#4b8de8"
     first_seen_at: int = Field(default_factory=now_ms)
     last_used_at: Optional[int] = None
+    catalog_available: bool = True
+    catalog_last_seen_at: Optional[int] = None
+    input_price_per_million: Optional[str] = None
+    output_price_per_million: Optional[str] = None
+    # G09 (#23) automatic pricing sync. USD-per-million decimal strings, like
+    # the two above. pricing_mode 'manual' rows are never touched by the sync.
+    cache_write_price_per_million: Optional[str] = None
+    cache_read_price_per_million: Optional[str] = None
+    pricing_mode: str = "auto"                 # 'manual' | 'auto'
+    pricing_source: Optional[str] = None       # provenance stamp on auto writes
+    pricing_litellm_key: Optional[str] = None  # matched catalog key
+    pricing_synced_at: Optional[int] = None    # epoch ms of last auto write
+    pricing_stale: bool = False                # last auto refresh failed
+    pricing_last_error: Optional[str] = None
 
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = (
+        UniqueConstraint("provider_id", "key", name="uq_model_provider_key"),
+        {"extend_existing": True},
+    )
 
 
 class ModelConfig(SQLModel, table=True):
@@ -72,6 +89,11 @@ class ModelConfig(SQLModel, table=True):
     mtp_model: Optional[str] = None
     speculative: Optional[str] = None
     created_at: int = Field(default_factory=now_ms)
+
+    __table_args__ = (
+        UniqueConstraint("model_id", "fingerprint", name="uq_modelconfig_model_fingerprint"),
+        Index("ix_modelconfig_model_created", "model_id", desc("created_at")),
+    )
 
 
 class BuildInfo(SQLModel, table=True):
@@ -138,6 +160,10 @@ class TelemetrySample(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint("provider_id", "model_id", "ts", name="uq_sample_prov_model_ts"),
         Index("ix_telemetrysample_provider_ts", "provider_id", "ts"),
+        # Per-model history: Model Detail and the selected-model card filter by
+        # a model and then want it newest-first.  Declared here, not only in a
+        # migration, so a freshly created database has it too.
+        Index("ix_telemetrysample_model_ts", "model_id", desc("ts")),
     )
 
 
@@ -162,6 +188,7 @@ class GpuTelemetrySample(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint("provider_id", "gpu_key", "ts",
                          name="uq_gpu_sample_prov_key_ts"),
+        Index("ix_gputelemetrysample_provider_ts", "provider_id", "ts"),
     )
 
 
@@ -209,6 +236,72 @@ class SessionRow(SQLModel, table=True):
     result_source: Optional[str] = None      # metrics / slots / incomplete
     created_at: int = Field(default_factory=now_ms)
 
+    __table_args__ = (
+        Index("ix_session_provider_end", "provider_id", "end_at"),
+        Index("ix_session_provider_start", "provider_id", desc("start_at")),
+        Index("ix_session_model_start", "model_id", desc("start_at")),
+        Index("ix_session_status_live_seen", "status", desc("live_seen_at")),
+    )
+
+
+class ModelUsageBucket(SQLModel, table=True):
+    """Minute-level durable usage aggregate: one row per (provider, model, minute).
+
+    Populated from positive counter deltas only. Counter resets create a new
+    baseline and never subtract previously recorded usage. ``estimated`` marks
+    backfilled records whose exact boundary cannot be reconstructed."""
+    __tablename__ = "modelusagebucket"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_id: int = Field(index=True, foreign_key="provider.id")
+    model_id: int = Field(index=True, foreign_key="model.id")
+    bucket_start: int = Field(index=True)      # minute-aligned epoch ms
+    input_tokens: float = 0.0
+    output_tokens: float = 0.0
+    unclassified_tokens: float = 0.0
+    prompt_time_s: float = 0.0
+    gen_time_s: float = 0.0
+    mtp_proposed: float = 0.0
+    mtp_accepted: float = 0.0
+    first_observed_at: int = 0
+    last_observed_at: int = 0
+    estimated: bool = False
+    provenance: str = "collector"              # collector | backfill
+
+    __table_args__ = (
+        UniqueConstraint("provider_id", "model_id", "bucket_start",
+                         name="uq_usagebucket_prov_model_start"),
+        Index("ix_usagebucket_prov_start", "provider_id", "bucket_start"),
+        # P02: covering index for the strict-range grouped SUMs (no per-row
+        # table fetches); carries exactly the columns those SUMs read.
+        Index("ix_usagebucket_cov_values", "provider_id", "model_id",
+              "bucket_start", "input_tokens", "output_tokens",
+              "unclassified_tokens", "prompt_time_s", "gen_time_s",
+              "mtp_proposed", "mtp_accepted"),
+    )
+
+
+class ModelResidency(SQLModel, table=True):
+    """One model load interval. At most one open (unloaded_at IS NULL) interval
+    may exist per provider/model; loaded time for a range is the sum of interval
+    overlap with that range."""
+    __tablename__ = "modelresidency"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_id: int = Field(index=True, foreign_key="provider.id")
+    model_id: int = Field(index=True, foreign_key="model.id")
+    loaded_at: int = Field(index=True)
+    last_seen_at: int = 0
+    unloaded_at: Optional[int] = None
+    source: str = "collector"                  # collector | backfill
+    estimated: bool = False
+
+    __table_args__ = (
+        Index("ix_residency_prov_model_loaded", "provider_id", "model_id", "loaded_at"),
+        Index("uq_residency_open", "provider_id", "model_id", unique=True,
+              sqlite_where=text("unloaded_at IS NULL")),
+    )
+
 
 class CollectorLease(SQLModel, table=True):
     """Single-writer lease for one SQLite database."""
@@ -222,3 +315,29 @@ class CollectorLease(SQLModel, table=True):
 class Setting(SQLModel, table=True):
     key: str = Field(primary_key=True)
     value: str = ""
+
+
+class PricingSyncRun(SQLModel, table=True):
+    """One automatic-pricing-sync run. Kept indefinitely (~1/day); the API
+    LIMIT is the only cap."""
+    __tablename__ = "pricingsyncrun"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trigger: str = "scheduled"                 # 'scheduled' | 'manual'
+    started_at: int = Field(index=True)        # epoch ms
+    finished_at: Optional[int] = None
+    # running | ok | partial | not_modified | error | interrupted
+    result: str = "running"
+    attempted: int = 0
+    updated: int = 0
+    skipped: int = 0
+    unresolved: int = 0
+    failed: int = 0
+    error_summary: Optional[str] = None        # short; no secrets, no reasoning
+    litellm_commit: Optional[str] = None
+    created_at: int = Field(default_factory=now_ms)
+
+    __table_args__ = (
+        Index("ix_pricingsyncrun_started", desc("started_at")),
+        {"extend_existing": True},
+    )

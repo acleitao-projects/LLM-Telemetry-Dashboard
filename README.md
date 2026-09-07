@@ -61,7 +61,9 @@ verify the whole pipeline end to end.
   multiple simultaneous slots. Six summary cards, a ranking table with activity
   state and sparklines, and a selected-model panel whose top section keeps the
   latest sanitized runtime snapshot (`n_gen`, observed `tg`, rolling `tg 3s`,
-  and an orange context gauge) separate from authoritative historical totals.
+  and an orange context gauge) separate from authoritative historical totals. The
+  ranking table also carries per-model input/output price and, when a secondary
+  display currency is set, a converted column.
 - **Model detail** — live state, time accounting (prompt / generation / idle
   stacked over loaded time), token buckets, prompt vs generation speed,
   context, MTP acceptance, hardware; the full observed launch configuration
@@ -82,7 +84,8 @@ verify the whole pipeline end to end.
   and utilization gauges for every device. Requires the host agent for host metrics.
 - **Settings** — system status (telemetry availability per metric group),
   provider CRUD with a passive connection test (health/metrics/props/models —
-  still no prompts), and display defaults.
+  still no prompts), display defaults, per-model pricing, a secondary display
+  currency backed by a pluggable FX source, and opt-in automatic pricing sync.
 
 ## Semantics
 
@@ -102,6 +105,11 @@ verify the whole pipeline end to end.
   collector lease becomes stale.
 - MTP acceptance = accepted / proposed × 100 over the range, from the
   server's cumulative MTP counters.
+- Prices are stored as exact decimal strings (no float drift); a range's cost
+  is tokens ÷ 1e6 × the unit price, summed per model.
+- A secondary currency is display-only: a background FX refresh converts
+  primary → secondary at render time; stored primary values are never rewritten.
+- The SQLite schema self-migrates forward on start (currently v15).
 
 ## Storage & retention
 
@@ -110,6 +118,16 @@ A background sweep every 5 minutes downsamples: raw samples are kept for 2 h,
 10-s buckets for 7 days, 60-s buckets for 30 days. Models, configs, builds,
 hardware and sessions are never pruned. Per-GPU samples follow the same
 2 h raw / 7 d 10-second / 30 d 60-second retention tiers.
+
+## Automatic pricing
+
+Optional and off by default. When enabled, a background worker — daily at a
+configurable time, or on demand via **Run now** — matches each model against a
+public pricing catalog (an LLM-assisted match routed through one of your already
+configured providers) and writes decimal input/output prices. Every run is
+recorded (`PricingSyncRun`) with the before/after values and a one-click restore.
+It never loads, unloads, or prompts your own models — it only reads the catalog
+and writes price columns. Endpoints live under `/api/settings/pricing-sync`.
 
 ## Optional host agent
 
