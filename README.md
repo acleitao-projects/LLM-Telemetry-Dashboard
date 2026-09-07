@@ -144,6 +144,10 @@ python3 host_agent.py --port 8091 --host 0.0.0.0
 
 Then set the provider's **Agent URL** to `http://<host>:8091`.
 
+## Documentation
+
+Full docs live in [`docs/`](docs/): [getting started](docs/getting-started.md), [installation](docs/installation.md), [configuration](docs/configuration.md), [providers](docs/providers.md), [dashboard guide](docs/dashboard-guide.md) (with screenshots), [architecture](docs/architecture.md), [operations](docs/operations.md), [upgrading](docs/upgrading.md), [troubleshooting](docs/troubleshooting.md), [security](docs/security.md).
+
 ## Stack
 
 FastAPI + Jinja2 + SQLite (SQLModel) + ECharts (vendored, no CDN) + vanilla JS.
