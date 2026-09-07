@@ -63,6 +63,7 @@ By default, a provider named **Local llama.cpp** at `http://127.0.0.1:8080` (age
 ## Screenshots
 
 ![Overview](docs/screenshots/overview.png)
+![Models](docs/screenshots/models.png)
 
 ## Pages at a glance
 
