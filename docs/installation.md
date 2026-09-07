@@ -5,7 +5,7 @@ This document covers the supported installation paths for LLM-Telemetry.
 ## Supported environments
 
 - **Linux** — primary target (verified on Ubuntu 24.04 / Debian 12)
-- **Python 3.12+** — required
+- **Python 3.11+** — required
 - **SQLite 3** — built into Python, no separate install needed
 
 No Dockerfile or Docker Compose is provided. Run it from a virtual environment, directly or under systemd.

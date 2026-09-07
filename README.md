@@ -1,160 +1,124 @@
 # LLM-Telemetry
 
-> This was built using Qwen 3.8 27B and Codex. The code was not reviewed and was designed to run on a closed network.
->
-> Use at your own risk. If something breaks, explodes, leaks memory, summons a daemon, or generally behaves in ways that disappoint you, I’ll be expecting your PR.
->
-> As a very wise developer once said:
->
-> “It runs on my machine.”
+> Passive observability dashboard for llama.cpp servers — read-only telemetry, no prompts, no inference control.
+
+[![License: 0BSD](https://img.shields.io/badge/License-0BSD-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-green.svg)](https://fastapi.tiangolo.com/)
+
+## What is this?
+
+LLM-Telemetry is a dark-mode dashboard that monitors one or more llama.cpp (or llama.cpp-compatible) inference servers. It polls `/health`, `/metrics`, `/props`, `/v1/models`, and `/slots` — nothing more — and turns the data into dense operational views: which models ran, how they were launched, how MTP behaved, and what the hardware was doing.
+
+**Hard rule:** LLM-Telemetry never sends prompts, triggers inference, loads models, or restarts anything. The only active write is the optional **Unload Models** action, which sends `/models/unload` for each currently loaded model on enabled providers.
 
 > [!WARNING]
-> LLM-Telemetry has no authentication. Do not expose it directly to the public internet; keep it on a trusted closed network or place it behind an authenticated reverse proxy.
+> **No authentication.** LLM-Telemetry is designed for trusted closed networks. Do not expose it directly to the public internet; place it behind an authenticated reverse proxy or restrict with firewall/VPN. See [SECURITY.md](SECURITY.md) and [docs/security.md](docs/security.md).
 
-Passive observability dashboard for llama.cpp servers. It watches one or more
-llama.cpp endpoints (plus an optional host agent) **read-only** and turns the
-stream into a dense, dark, technical dashboard: which models did the work,
-how they were launched, how MTP behaved, and what the hardware was doing.
+## Why
 
-**Hard rule:** LLM-Telemetry never sends prompts, never triggers inference,
-never loads/unloads models, never restarts anything. It only reads the
-read-only endpoints `/health`, `/metrics`, `/props`, `/v1/models`, and `/slots` of a
-llama.cpp server, and (optionally) `/info`, `/gpu`, `/llama` of the
-passive host agent.
+You have a llama.cpp server running inference. You want to know:
+
+- Which models are doing the work right now?
+- How fast are they generating tokens?
+- What launch configuration produced these results?
+- How much GPU VRAM, power, and temperature did each model consume?
+- What are the per-session TTFT, speeds, and context peaks?
+
+LLM-Telemetry answers all of these questions with **passive, read-only** polling. No prompts touch your server.
 
 ## Quick start
 
 ```bash
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt   # Windows
-# .venv/bin/pip install -r requirements.txt    # Linux/macOS
+# 1. Clone, create venv, install dependencies
+git clone https://github.com/acleitao-projects/LLM-Telemetry-Dashboard.git
+cd LLM-Telemetry-Dashboard
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
 
-.venv\Scripts\python app.py            # real mode (default provider: local llama.cpp)
-.venv\Scripts\python app.py --demo     # demo mode: 30 days of synthetic data, no network
+# 2. Start in demo mode (no network, synthetic data)
+python app.py --demo
 ```
 
-Open http://127.0.0.1:8090
+Open **http://127.0.0.1:8090**
 
-By default, a provider named **Local llama.cpp** pointing at
-`http://127.0.0.1:8080` (agent `http://127.0.0.1:8091`) is created on
-first start, in every mode. If the server is unreachable the app still starts;
-the provider shows as `STALE` (no data for 20 s) and then `OFFLINE`. Add more
-providers under **Settings → Providers**.
+You will see:
 
-### Demo mode
+```
+observatory listening on http://127.0.0.1:8090 (demo)
+```
 
-`python app.py --demo` uses a separate database (`data/observatory_demo.db`),
-seeds ~30 days of synthetic history (6 models across 4 families, MTP on two of
-them, two launch configs per model, hardware/build info) and then keeps
-producing *live* synthetic activity through the exact same collector path the
-real mode uses. It never touches the network. Use it to explore the UI or to
-verify the whole pipeline end to end.
+30 days of synthetic history load automatically. Explore the dashboard with real data, no network calls.
 
-## Pages
+### Real mode
 
-- **Overview** — current state of the busiest slot (state badge, t/s, context,
-  MTP), today's tokens/inference/utilization, 24 h token activity by model,
-  7-day inference-time and token leaders, recent sessions.
-- **Models** — the workhorse page. Group by **Family** (rolls quants of one
-  model together), **Each file**, or **Quant**; range Today … All; sort by
-  **Active / Inference / Loaded / Idle** time. Active is the default and supports
-  multiple simultaneous slots. Six summary cards, a ranking table with activity
-  state and sparklines, and a selected-model panel whose top section keeps the
-  latest sanitized runtime snapshot (`n_gen`, observed `tg`, rolling `tg 3s`,
-  and an orange context gauge) separate from authoritative historical totals. The
-  ranking table also carries per-model input/output price and, when a secondary
-  display currency is set, a converted column.
-- **Model detail** — live state, time accounting (prompt / generation / idle
-  stacked over loaded time), token buckets, prompt vs generation speed,
-  context, MTP acceptance, hardware; the full observed launch configuration
-  with a **Full launch flags** dump and **config history** (every distinct
-  launch config observed, kept forever).
-- **Sessions** — externally driven inference sessions detected passively from
-  llama.cpp slot/task identity, with explicitly provisional live progress and
-  authoritative completed totals from `/metrics`. Filter by
-  provider, model, quant, MTP on/off, reasoning effort, range.
-- **Session detail** — TTFT, prompt/gen tokens and speeds, peaks, context
-  peak, MTP acceptance, hardware averages, per-second series, the launch
-  config that session ran with.
-- **Compare** — line up to five observed model families side by side across a
-  shared range. Files and quants are aggregated; nothing is executed.
-- **Hardware** — host (CPU/RAM/GPU/driver/PCIe), authoritative llama.cpp build
-  version/commit from `/props`, and 1 h per-GPU utilization, VRAM, temperature
-  and power series alongside CPU/RAM. Live GPU cards use separate orange VRAM
-  and utilization gauges for every device. Requires the host agent for host metrics.
-- **Settings** — system status (telemetry availability per metric group),
-  provider CRUD with a passive connection test (health/metrics/props/models —
-  still no prompts), display defaults, per-model pricing, a secondary display
-  currency backed by a pluggable FX source, and opt-in automatic pricing sync.
-
-## Semantics
-
-- All timestamps are integer epoch milliseconds.
-- Counters are cumulative server values; LLM-Telemetry stores them and derives
-  deltas. A counter reset (restart) starts a new epoch: the session is closed,
-  baselines re-anchor, and no negative deltas are ever produced.
-- Runtime states: `UNLOADED / LOADING / IDLE / PROMPTING / GENERATING`.
-  **Inference time = prompting + generation**; IDLE time is loaded-but-idle
-  and is never counted as inference. **Model utilization = inference / loaded**.
-- Sessions start when `/slots` reports a processing task, carry the launch config that was
-  active at the time, and record TTFT (first generated delta after a prompt
-  phase), per-session MTP proposed/accepted, context peak, and hardware
-  averages. Live slot counts are never added to completed metric totals.
-- A renewable SQLite lease permits only one collector per database. Additional
-  dashboard processes stay read-only and automatically take over if the active
-  collector lease becomes stale.
-- MTP acceptance = accepted / proposed × 100 over the range, from the
-  server's cumulative MTP counters.
-- Prices are stored as exact decimal strings (no float drift); a range's cost
-  is tokens ÷ 1e6 × the unit price, summed per model.
-- A secondary currency is display-only: a background FX refresh converts
-  primary → secondary at render time; stored primary values are never rewritten.
-- The SQLite schema self-migrates forward on start (currently v15).
-
-## Storage & retention
-
-SQLite (WAL) at `data/observatory.db` (demo: `data/observatory_demo.db`).
-A background sweep every 5 minutes downsamples: raw samples are kept for 2 h,
-10-s buckets for 7 days, 60-s buckets for 30 days. Models, configs, builds,
-hardware and sessions are never pruned. Per-GPU samples follow the same
-2 h raw / 7 d 10-second / 30 d 60-second retention tiers.
-
-## Automatic pricing
-
-Optional and off by default. When enabled, a background worker — daily at a
-configurable time, or on demand via **Run now** — matches each model against a
-public pricing catalog (an LLM-assisted match routed through one of your already
-configured providers) and writes decimal input/output prices. Every run is
-recorded (`PricingSyncRun`) with the before/after values and a one-click restore.
-It never loads, unloads, or prompts your own models — it only reads the catalog
-and writes price columns. Endpoints live under `/api/settings/pricing-sync`.
-
-## Optional host agent
-
-`host_agent.py` is a stdlib-only passive agent for the inference host
-(Linux). It reports host facts (OS, CPU, RAM, GPUs via `nvidia-smi`, PCIe),
-the llama.cpp build (version/commit/docker image/container from
-`/proc/<pid>/cmdline` and env), and live per-GPU/CPU gauges with stable GPU
-identity — reading only,
-never controlling Docker or the server.
+When ready for production data:
 
 ```bash
-python3 host_agent.py --port 8091 --host 0.0.0.0
+python app.py              # reads from your configured providers
 ```
 
-Then set the provider's **Agent URL** to `http://<host>:8091`.
+By default, a provider named **Local llama.cpp** at `http://127.0.0.1:8080` (agent `http://127.0.0.1:8091`) is created on first start. If unreachable, it shows as `STALE`/`OFFLINE`. Add your own providers under **Settings → Providers**.
 
-## Documentation
+## Screenshots
 
-Full docs live in [`docs/`](docs/): [getting started](docs/getting-started.md), [installation](docs/installation.md), [configuration](docs/configuration.md), [providers](docs/providers.md), [dashboard guide](docs/dashboard-guide.md) (with screenshots), [architecture](docs/architecture.md), [operations](docs/operations.md), [upgrading](docs/upgrading.md), [troubleshooting](docs/troubleshooting.md), [security](docs/security.md).
+![Overview](docs/screenshots/overview.png)
+
+## Pages at a glance
+
+| Page | Purpose |
+|------|---------|
+| [Overview](docs/dashboard-guide.md#overview) | Current slot state, today's tokens/inference/utilization, 24 h activity by model, 7-day leaderboards, recent sessions |
+| [Models](docs/dashboard-guide.md#models) | Group-by-family ranking table with activity state, sparklines, and a selected-model panel showing live runtime snapshot |
+| [Model Detail](docs/dashboard-guide.md#model-detail) | Time accounting (prompt / generation / idle), token buckets, prompt vs generation speed, context, MTP acceptance, full config history |
+| [Sessions](docs/dashboard-guide.md#sessions) | Externally driven inference sessions detected passively from slot/task identity; filter by provider, model, quant, MTP, reasoning effort |
+| [Session Detail](docs/dashboard-guide.md#session-detail) | TTFT, speeds, peaks, context peak, MTP acceptance, hardware averages, per-second series |
+| [Compare](docs/dashboard-guide.md#compare) | Line up to five observed model files side by side across a shared time range; export as shareable PNG |
+| [Hardware](docs/dashboard-guide.md#hardware) | CPU/RAM/GPU/PCIe host facts, llama.cpp build version, per-GPU utilization/VRAM/temperature/power series |
+| [Settings](docs/dashboard-guide.md#settings) | Provider CRUD with connection test, display defaults, per-model pricing, a secondary display currency, and opt-in automatic pricing sync |
+
+## Key features
+
+- **Passive, read-only telemetry** — polls `/health`, `/metrics`, `/props`, `/v1/models`, `/slots`; never sends prompts
+- **Multiple providers** — connect to several llama.cpp or compatible servers simultaneously
+- **Model-family grouping** — roll quantizations of the same model together; group by Family, Each file, or Quant
+- **Time ranges** — Today, 2d, 3d, 5d, 7d, 30d, or All
+- **Session tracking** — detects externally driven inference sessions from slot/task identity with provisional live progress
+- **Counter-reset handling** — server restarts close sessions, re-anchor baselines, no negative deltas
+- **MTP tracking** — proposed/accepted rates and acceptance percentage
+- **Config history** — every distinct launch config observed, kept forever
+- **Model pricing** — exact-decimal input/output prices; optional secondary display currency (FX refresh, display-only)
+- **Automatic pricing** — opt-in background worker matches models to a public catalog and writes prices; never prompts your models
+- **Compare screen** — side-by-side model comparison with exportable PNG
+- **Hardware telemetry** — CPU, RAM, per-GPU utilization/VRAM/temperature/power via optional host agent
+- **Three-tier retention** — 2 h raw samples → 7 d minute buckets → 30 d hourly buckets; models/configs/hardware/sessions never pruned
+- **Single-writer lease** — renewable SQLite lease permits only one collector per database; additional processes stay read-only
+- **Demo mode** — `--demo` flag seeds 30 days of synthetic history and keeps producing live synthetic activity
+- **Screenshot capture** — embed page captures in documentation via `/api/screenshots/` endpoint
+- **Live SSE updates** — real-time snapshot broadcast at 1-second intervals
 
 ## Stack
 
-FastAPI + Jinja2 + SQLite (SQLModel) + ECharts (vendored, no CDN) + vanilla JS.
-No frontend build step.
+- **Backend:** FastAPI, uvicorn, SQLModel (SQLite), Jinja2
+- **Frontend:** ECharts (vendored, no CDN), vanilla JavaScript, CSS with dark/light themes
+- **Deployment:** run directly or under systemd (see [docs/installation.md](docs/installation.md))
+- No frontend build step
 
-## Continuous integration
+## Documentation
 
-Pushes and pull requests run the complete Python regression suite on a
-GitHub-hosted runner. This public repository contains no automated deployment
-job and has no connection to a production environment or self-hosted runner.
+| Guide | Description |
+|-------|-------------|
+| [Getting Started](docs/getting-started.md) | Zero-to-visible-telemetry walkthrough |
+| [Installation](docs/installation.md) | Local dev and running as a systemd service |
+| [Configuration](docs/configuration.md) | All settings, providers, demo mode, retention |
+| [Providers](docs/providers.md) | llama.cpp integration, agent setup, connectivity |
+| [Dashboard Guide](docs/dashboard-guide.md) | Every screen with screenshots |
+| [Architecture](docs/architecture.md) | Component diagram, data flow, collector lifecycle |
+| [Operations](docs/operations.md) | Startup, shutdown, health checks, backups, logging |
+| [Upgrading](docs/upgrading.md) | Safe update procedure, schema migration |
+| [Troubleshooting](docs/troubleshooting.md) | Common problems and diagnostics |
+| [Security](docs/security.md) | Trusted-network assumptions, exposure risks |
+
+## License
+
+0BSD — see [LICENSE](LICENSE). Do whatever you want; no attribution required.
