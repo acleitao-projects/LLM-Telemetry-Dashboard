@@ -1,6 +1,6 @@
 """Demo mode: a synthetic llama.cpp provider plus 30 days of history.
 
-Demo mode NEVER contacts an external server. It runs the real collector against a
+Demo mode NEVER contacts the network. It runs the real collector against a
 fake client that serves the same read-only interface (health/metrics/
 props/models) with realistic values.
 """
@@ -19,8 +19,8 @@ from . import database as db
 from .llama_provider import FakeClient
 from .models import (BuildInfo, HardwareInfo, Model, ModelConfig, Provider,
                      SessionRow, TelemetrySample, now_ms)
-from .settings import (DEFAULT_PROVIDER_AGENT_URL, DEFAULT_PROVIDER_NAME,
-                       DEFAULT_PROVIDER_TYPE, DEFAULT_PROVIDER_URL)
+from .settings import (DEFAULT_PROVIDER_AGENT_URL, DEFAULT_PROVIDER_NAME, DEFAULT_PROVIDER_TYPE,
+                       DEFAULT_PROVIDER_URL)
 from .metrics import parse_model_name
 
 DAY = 86400.0
@@ -294,8 +294,7 @@ class DemoWorld:
         palette = ["#4b8de8", "#d8733e", "#48a77c", "#d29b25", "#8a7bc8", "#4fa3a5"]
         with Session(engine) as s:
             prov = Provider(
-                name=DEFAULT_PROVIDER_NAME, ptype=DEFAULT_PROVIDER_TYPE,
-                base_url=DEFAULT_PROVIDER_URL,
+                name=DEFAULT_PROVIDER_NAME, ptype=DEFAULT_PROVIDER_TYPE, base_url=DEFAULT_PROVIDER_URL,
                 agent_url=DEFAULT_PROVIDER_AGENT_URL, enabled=True, is_default=True,
                 poll_interval_s=1.0, status="LIVE",
                 last_success_at=int(now * 1000), latency_ms=11.0,

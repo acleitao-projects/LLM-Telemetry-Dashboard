@@ -7,6 +7,7 @@
   <div style="display:flex;gap:8px;flex-wrap:wrap">
     <div class="seg" id="grpSeg"></div>
     <div class="seg" id="rngSeg"></div>
+    <a class="capture-btn" href="about:blank" target="_blank" data-capture-target="pageContent" data-capture-width="1800" data-capture-ignore aria-label="Capture Models screen as an image">CAPTURE SCREEN</a>
   </div>
 </div>
 
@@ -18,21 +19,27 @@
       <span>MODELS LIST</span>
       <a class="capture-btn" href="about:blank" target="_blank" data-capture-target="modelsListPanel" aria-label="Capture models list as an image">CAPTURE</a>
     </div>
-    <table class="data-table" id="modelTable">
-      <thead>
-        <tr>
-          <th class="m-rank">#</th>
-          <th>Model</th>
-          <th class="share-cell" id="sortMetricHead">Active</th>
-          <th style="width:84px">Activity</th>
-          <th class="num">Tokens</th>
-          <th class="num">Share</th>
-          <th class="num">Sess</th>
-          <th class="num">Avg t/s</th>
-        </tr>
-      </thead>
-      <tbody id="modelTableBody"></tbody>
-    </table>
+    <div class="table-scroll">
+      <table class="data-table models-table" id="modelTable">
+        <thead>
+          <tr>
+            <th class="m-rank">#</th>
+            <th class="col-model">Model</th>
+            <th class="col-activity">Activity</th>
+            <th class="num col-tok">In tok</th>
+            <th class="num col-tok">Out tok</th>
+            <th class="num col-tok">Total</th>
+            <th class="num col-cost">In cost</th>
+            <th class="num col-cost">Out cost</th>
+            <th class="num col-cost">Cost</th>
+            <th class="num">Sess</th>
+            <th class="num">t/s</th>
+            <th class="col-spark">Trend</th>
+          </tr>
+        </thead>
+        <tbody id="modelTableBody"></tbody>
+      </table>
+    </div>
   </div>
   <div class="panel" id="selPanel">
     <div class="empty">select a model</div>

@@ -111,6 +111,26 @@ FAMILY_TAG_TOKENS = {
 
 RANGE_KEYS = ["today", "2d", "3d", "5d", "7d", "30d", "all"]
 
+# How long a range snapshot is served without rebuilding.
+#
+# This has to exceed the dashboard's polling interval, and it did not: the
+# Models page refreshes every 7 s (MODELS_REFRESH_MS in static/js/app.js) while
+# this was 5 s, so every single poll arrived just after the entry went stale.
+# The registry served the stale value and kicked off a background rebuild --
+# every 7 s, per key, for as long as anyone had the page open.
+#
+# Production showed it plainly: 193 cache hits against 1,723 stale serves and
+# 891 rebuilds at ~655 ms each. Rebuilding a snapshot nothing had invalidated,
+# continuously, is the load that #47 describes as starving the collector.
+#
+# The correctness bound is the data version, not this number: the collector
+# bumps data_generation at most once per calendar minute while polling, and any
+# bump makes the entry stale immediately whatever its age. So this only needs
+# to sit above the poll interval and below that one-minute bump, which leaves a
+# comfortable window. A snapshot embeds `now`, which is why it is not simply
+# unbounded.
+SNAPSHOT_REVALIDATE_S = 30.0
+
 # chart bucket sizes (seconds) per range for detail graphs
 RANGE_BUCKETS = {
     "1m": 2, "5m": 10, "15m": 30, "1h": 60, "session": 2,

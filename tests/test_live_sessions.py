@@ -268,6 +268,18 @@ class SlotSessionTests(unittest.TestCase):
             self.assertEqual(selected["realtime"]["session_id"], run.id)
             self.assertEqual(selected["realtime"]["session_started_at"], run.start_at)
 
+            snapshot = metrics.realtime_snapshot(session)
+            self.assertEqual(len(snapshot["active_models"]), 1)
+            shared_live = snapshot["active_models"][0]["realtime"]
+            self.assertEqual(shared_live["gen_tps_3s"], 8.2)
+            with patch.object(metrics, "_selected_realtime",
+                              side_effect=AssertionError("historical lookup not allowed")):
+                shared = metrics.selected_stats(
+                    session, [model.id], None, "today",
+                    realtime_override=shared_live,
+                )
+            self.assertEqual(shared["realtime"]["status"], "LIVE")
+
     def test_closed_session_preserves_provisional_snapshot_for_selected_runtime(self):
         engine = memory_engine()
         now = int(time.time() * 1000)
@@ -421,8 +433,8 @@ class CollectorLeaseTests(unittest.TestCase):
             self.assertEqual(lease.owner_id, second.owner_id)
 
 
-class ModelFamilyCompareTests(unittest.TestCase):
-    def test_family_compare_uses_weighted_native_durations_and_mixed_config(self):
+class ModelFileCompareTests(unittest.TestCase):
+    def test_file_compare_keeps_model_files_separate(self):
         engine = memory_engine()
         now = int(time.time() * 1000)
         with Session(engine) as session:
@@ -441,6 +453,11 @@ class ModelFamilyCompareTests(unittest.TestCase):
                 session.add(ModelConfig(model_id=model.id, fingerprint=name,
                                         split_mode="tensor" if quant == "Q4_0" else "layer"))
             for model, tokens, seconds in ((models[0], 100, 10), (models[1], 300, 15)):
+                session.add(SessionRow(provider_id=provider.id, model_id=model.id,
+                                       start_at=now - 2500, end_at=now - 500,
+                                       status="COMPLETE", gen_tokens=tokens,
+                                       total_tokens=tokens, gen_time_s=seconds,
+                                       peak_gen_tps=tokens / seconds))
                 session.add(TelemetrySample(provider_id=provider.id, model_id=model.id,
                                             ts=now - 2000, state="GENERATING",
                                             gen_total=0, gen_seconds_total=0))
@@ -449,13 +466,761 @@ class ModelFamilyCompareTests(unittest.TestCase):
                                             gen_total=tokens, gen_seconds_total=seconds,
                                             gen_tps=tokens / seconds))
             session.commit()
-            data = metrics.compare_models(session, ["family-a"], None, "7d")
-            item = data["models"][0]
-            self.assertEqual(item["avg_gen_tps"], 16.0)
-            self.assertEqual(item["gen_tokens"], 400)
-            self.assertEqual(item["quants"], ["Q4_0", "Q8_0"])
-            self.assertEqual(item["configuration"], "mixed")
-            self.assertEqual(item["split_mode"], "mixed")
+            candidates = metrics.compare_model_candidates(session, None, "7d")
+            self.assertEqual({row["label"] for row in candidates},
+                             {"family-a-q8", "family-a-q4"})
+            self.assertEqual({row["quant"] for row in candidates}, {"Q8_0", "Q4_0"})
+            self.assertEqual({row["key"] for row in candidates},
+                             {str(models[0].id), str(models[1].id)})
+
+            with patch.object(metrics, "aggregate_range_summary",
+                              wraps=metrics.aggregate_range_summary) as aggregate, \
+                    patch.object(metrics, "_gpu_rows",
+                                 wraps=metrics._gpu_rows) as fetch_gpu:
+                data = metrics.compare_models(
+                    session, [str(models[0].id), str(models[1].id)], None, "7d")
+            self.assertEqual(aggregate.call_count, 1)
+            self.assertEqual(fetch_gpu.call_count, 0)
+            first, second = data["models"]
+            self.assertEqual(first["model"], "family-a-q4")
+            self.assertEqual(first["avg_gen_tps"], 10.0)
+            self.assertEqual(first["gen_tokens"], 100)
+            self.assertEqual(first["quant"], "Q4_0")
+            self.assertEqual(first["configuration"], "single")
+            self.assertEqual(first["split_mode"], "tensor")
+            self.assertEqual(second["model"], "family-a-q8")
+            self.assertEqual(second["avg_gen_tps"], 20.0)
+            self.assertEqual(second["gen_tokens"], 300)
+
+            with patch.object(metrics, "_gpu_rows",
+                              wraps=metrics._gpu_rows) as fetch_gpu:
+                metrics.compare_model_gpus(
+                    session, [str(models[0].id), str(models[1].id)], None, "7d")
+            # The deferred table decoration is a SQLite aggregate, not a
+            # full GPU-history load for every compared model.
+            self.assertEqual(fetch_gpu.call_count, 0)
+
+
+class SqlFreshnessTests(unittest.TestCase):
+    def test_active_models_excludes_stale_rows_via_sql(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            fresh = SessionRow(provider_id=provider.id, model_id=model.id,
+                               status="ACTIVE", start_at=now - 5000,
+                               live_seen_at=now - 1000)
+            stale = SessionRow(provider_id=provider.id, model_id=model.id,
+                               status="ACTIVE", start_at=now - 60000,
+                               live_seen_at=now - 30000)
+            fresh_fin = SessionRow(provider_id=provider.id, model_id=model.id,
+                                   status="FINALIZING", start_at=now - 5000,
+                                   live_seen_at=now - 5000)
+            stale_fin = SessionRow(provider_id=provider.id, model_id=model.id,
+                                   status="FINALIZING", start_at=now - 60000,
+                                   live_seen_at=now - 20000)
+            session.add_all([fresh, stale, fresh_fin, stale_fin])
+            session.commit()
+            result = metrics._active_models(session, now)
+            self.assertIn(model.id, result)
+            self.assertEqual(result[model.id]["task_count"], 2)
+
+    def test_reconcile_stale_sessions_marks_interrupted_and_incomplete(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            stale_active = SessionRow(provider_id=provider.id, model_id=model.id,
+                                      status="ACTIVE", start_at=now - 200_000,
+                                      live_seen_at=now - 150_000)
+            stale_fin = SessionRow(provider_id=provider.id, model_id=model.id,
+                                   status="FINALIZING", start_at=now - 200_000,
+                                   live_seen_at=now - 150_000)
+            fresh_active = SessionRow(provider_id=provider.id, model_id=model.id,
+                                      status="ACTIVE", start_at=now - 5000,
+                                      live_seen_at=now - 1000)
+            session.add_all([stale_active, stale_fin, fresh_active])
+            session.commit()
+            sa_id = stale_active.id
+            sf_id = stale_fin.id
+            fa_id = fresh_active.id
+            collector = Collector(lambda _: None)
+            from observatory.collector import _PollEvidence
+            evidence = {provider.id: _PollEvidence(
+                provider_id=provider.id, gen=0, models_ok=True,
+                loaded_model_keys={"m1"},
+                slot_evidence={"m1": (True, set())},
+            )}
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            rows = {r.id: r for r in session.exec(select(SessionRow)).all()}
+            self.assertEqual(rows[sa_id].status, "INTERRUPTED")
+            self.assertEqual(rows[sf_id].status, "INCOMPLETE")
+            self.assertEqual(rows[fa_id].status, "ACTIVE")
+
+    def test_last_used_at_only_on_token_activity(self):
+        engine = memory_engine()
+        client = SequenceClient()
+        collector = Collector(lambda _: client)
+        now = time.time()
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            entry = {"key": "model-a", "loaded": True, "args": [], "meta": {}}
+            client.slot_payload = []
+            client.gen_total = 0
+            collector._poll_model(session, provider, entry, {}, None, client,
+                                  {"status": "ok"}, {}, int(now * 1000), now)
+            state = collector.model_states[(provider.id, "model-a")]
+            session.expire_all()
+            model = session.exec(select(Model)).one()
+            self.assertIsNotNone(model.first_seen_at)
+            self.assertIsNone(model.last_used_at)
+
+
+class ReconciliationSafetyTests(unittest.TestCase):
+    """Production-data-safety regression tests for startup reconciliation."""
+
+    def _make_collector_with_evidence(self, engine, provider_ids, model_key="m1"):
+        """Create a collector with startup evidence for the given providers."""
+        collector = Collector(lambda _: None)
+        from observatory.collector import _PollEvidence
+        evidence = {}
+        with Session(engine) as s:
+            providers = s.exec(select(Provider)).all()
+        for p in providers:
+            if p.id in provider_ids:
+                evidence[p.id] = _PollEvidence(
+                    provider_id=p.id, gen=0, models_ok=True,
+                    loaded_model_keys={model_key},
+                    slot_evidence={model_key: (True, set())},
+                )
+        return collector, evidence
+
+    def test_standby_start_performs_no_session_writes(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            stale = SessionRow(provider_id=provider.id, model_id=model.id,
+                               status="ACTIVE", start_at=now - 300_000,
+                               live_seen_at=now - 200_000)
+            session.add(stale)
+            session.commit()
+            stale_id = stale.id
+        collector = Collector(lambda _: None)
+        with patch("observatory.collector.db.new_session",
+                   side_effect=lambda: Session(engine)):
+            collector.start()
+            time.sleep(0.1)
+            collector.stop()
+        with Session(engine) as session:
+            row = session.get(SessionRow, stale_id)
+            self.assertEqual(row.status, "ACTIVE")
+            self.assertEqual(row.end_at, None)
+
+    def test_active_session_survives_restart_below_grace(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 5000,
+                              live_seen_at=now - 11_000,
+                              source_slot_id=0, source_task_id=7)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].slot_evidence = {
+                "m1": (True, {(0, 7)})
+            }
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "ACTIVE")
+            self.assertIsNone(row.end_at)
+
+    def test_finalizing_session_survives_restart_below_grace(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="FINALIZING", start_at=now - 5000,
+                              live_seen_at=now - 16_000,
+                              source_slot_id=0, source_task_id=7)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].slot_evidence = {
+                "m1": (True, {(0, 7)})
+            }
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "FINALIZING")
+
+    def test_authoritative_absence_terminalizes(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 200_000,
+                              live_seen_at=now - 150_000,
+                              source_slot_id=0, source_task_id=7)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].slot_evidence = {
+                "m1": (True, set())
+            }
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "INTERRUPTED")
+            self.assertEqual(row.result_source, "interrupted")
+
+    def test_slots_poll_failed_preserves_session(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 200_000,
+                              live_seen_at=now - 150_000,
+                              source_slot_id=0, source_task_id=7)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].slot_evidence = {
+                "m1": (False, set())
+            }
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "ACTIVE")
+
+    def test_model_list_not_authoritative_preserves(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 200_000,
+                              live_seen_at=now - 150_000)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].models_ok = False
+            evidence[provider.id].loaded_model_keys = set()
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "ACTIVE")
+
+    def test_provider_poll_failed_preserves_session(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 200_000,
+                              live_seen_at=now - 150_000)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector = Collector(lambda _: None)
+            from observatory.collector import _PollEvidence
+            evidence = {}
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "ACTIVE")
+
+    def test_boundary_at_grace_threshold(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        grace = 120_000
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            below = SessionRow(provider_id=provider.id, model_id=model.id,
+                               status="ACTIVE", start_at=now - 200_000,
+                               live_seen_at=now - (grace - 5000))
+            above = SessionRow(provider_id=provider.id, model_id=model.id,
+                               status="ACTIVE", start_at=now - 200_000,
+                               live_seen_at=now - (grace + 5000))
+            session.add_all([below, above])
+            session.commit()
+            below_id = below.id
+            above_id = above.id
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].slot_evidence = {"m1": (True, set())}
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            rows = {r.id: r for r in session.exec(select(SessionRow)).all()}
+            self.assertEqual(rows[below_id].status, "ACTIVE")
+            self.assertEqual(rows[above_id].status, "INTERRUPTED")
+
+    def test_null_live_seen_at_old_start_terminalized(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 200_000,
+                              live_seen_at=None)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].slot_evidence = {"m1": (True, set())}
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "INTERRUPTED")
+            self.assertIsNone(row.end_at)
+            self.assertIsNone(row.duration_s)
+
+    def test_null_live_seen_at_recent_start_preserved(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 5_000,
+                              live_seen_at=None)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "ACTIVE")
+
+    def test_null_live_seen_at_finalizing(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="FINALIZING", start_at=now - 200_000,
+                              live_seen_at=None)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].slot_evidence = {"m1": (True, set())}
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "INCOMPLETE")
+            self.assertIsNone(row.duration_s)
+
+    def test_token_bearing_zero_duration_not_fabricated(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 200_000,
+                              live_seen_at=now - 200_000,
+                              gen_tokens=500, prompt_tokens=100,
+                              total_tokens=600)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].slot_evidence = {"m1": (True, set())}
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "INTERRUPTED")
+            self.assertIsNone(row.end_at)
+            self.assertIsNone(row.duration_s)
+
+    def test_restart_idempotency(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 200_000,
+                              live_seen_at=now - 150_000)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector, evidence = self._make_collector_with_evidence(
+                engine, {provider.id})
+            evidence[provider.id].slot_evidence = {"m1": (True, set())}
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            first_status = session.get(SessionRow, sess.id).status
+            first_end = session.get(SessionRow, sess.id).end_at
+            collector._reconcile_after_startup(session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, first_status)
+            self.assertEqual(row.end_at, first_end)
+            count = len(session.exec(select(SessionRow)).all())
+            self.assertEqual(count, 1)
+
+    def test_new_task_does_not_resurrect_terminal_session(self):
+        engine = memory_engine()
+        now = time.time()
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            old = SessionRow(provider_id=provider.id, model_id=model.id,
+                             status="INTERRUPTED", start_at=now - 60_000,
+                             source_slot_id=0, source_task_id=5,
+                             end_at=now - 50_000, duration_s=10.0)
+            session.add(old)
+            session.commit()
+            session.refresh(old)
+            state = ProviderState(model_id=model.id, model_key=model.key)
+            slots = _slot_snapshots(live_slot(100, task=5, slot=0))
+            collector = Collector(lambda _: None)
+            collector._sync_live_tasks(session, provider, state, {},
+                                       slots, int(now * 1000), now)
+            session.expire_all()
+            rows = session.exec(select(SessionRow).order_by(SessionRow.id)).all()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0].status, "INTERRUPTED")
+            self.assertEqual(rows[0].id, old.id)
+            self.assertEqual(rows[1].status, "ACTIVE")
+            self.assertNotEqual(rows[1].id, old.id)
+
+    def test_production_shaped_file_copy(self):
+        import tempfile
+        import os
+        from sqlalchemy import create_engine as sa_create_engine
+        from sqlalchemy.pool import StaticPool as SAStaticPool
+        tmp = tempfile.mkdtemp()
+        db_path = os.path.join(tmp, "test.db")
+        try:
+            eng = sa_create_engine(
+                f"sqlite:///{db_path}",
+                connect_args={"check_same_thread": False},
+                poolclass=SAStaticPool,
+            )
+            SQLModel.metadata.create_all(eng)
+            now = int(time.time() * 1000)
+            with Session(eng) as s:
+                p1 = Provider(name="p1", base_url="http://a")
+                p2 = Provider(name="p2", base_url="http://b")
+                s.add_all([p1, p2])
+                s.commit()
+                s.refresh(p1)
+                s.refresh(p2)
+                p1_id, p2_id = p1.id, p2.id
+                m1 = Model(provider_id=p1_id, key="m1", name="m1")
+                m2 = Model(provider_id=p2_id, key="m2", name="m2")
+                s.add_all([m1, m2])
+                s.commit()
+                s.refresh(m1)
+                s.refresh(m2)
+                m1_id, m2_id = m1.id, m2.id
+                s.add_all([
+                    SessionRow(provider_id=p1_id, model_id=m1_id,
+                               status="ACTIVE", start_at=now - 200_000,
+                               live_seen_at=now - 150_000,
+                               gen_tokens=100, prompt_tokens=50,
+                               total_tokens=150),
+                    SessionRow(provider_id=p1_id, model_id=m1_id,
+                               status="CLOSED", start_at=now - 500_000,
+                               end_at=now - 400_000, duration_s=100.0,
+                               gen_tokens=200, total_tokens=250),
+                    SessionRow(provider_id=p2_id, model_id=m2_id,
+                               status="ACTIVE", start_at=now - 300_000,
+                               live_seen_at=None,
+                               gen_tokens=50, prompt_tokens=20,
+                               total_tokens=70),
+                ])
+                s.add(TelemetrySample(provider_id=p1_id, model_id=m1_id,
+                                      ts=now - 100_000, state="GENERATING",
+                                      gen_total=100))
+                s.commit()
+            with Session(eng) as s:
+                collector = Collector(lambda _: None)
+                from observatory.collector import _PollEvidence
+                evidence = {
+                    p1_id: _PollEvidence(
+                        provider_id=p1_id, gen=0, models_ok=True,
+                        loaded_model_keys={"m1"},
+                        slot_evidence={"m1": (True, set())}),
+                    p2_id: _PollEvidence(
+                        provider_id=p2_id, gen=0, models_ok=True,
+                        loaded_model_keys={"m2"},
+                        slot_evidence={"m2": (True, set())}),
+                }
+                collector._reconcile_after_startup(
+                    s, evidence, {p1_id, p2_id})
+                s.expire_all()
+                sessions = s.exec(select(SessionRow)).all()
+                telemetry = s.exec(select(TelemetrySample)).all()
+                provs = s.exec(select(Provider)).all()
+                models = s.exec(select(Model)).all()
+                session_data = [(r.id, r.provider_id, r.status, r.end_at,
+                                 r.duration_s, r.gen_tokens, r.total_tokens)
+                                for r in sessions]
+            self.assertEqual(len(sessions), 3)
+            self.assertEqual(len(telemetry), 1)
+            self.assertEqual(len(provs), 2)
+            self.assertEqual(len(models), 2)
+            active_count = sum(1 for r in sessions if r.status == "ACTIVE")
+            self.assertEqual(active_count, 0)
+            self.assertEqual(
+                sum(1 for r in sessions if r.status == "INTERRUPTED"), 2)
+            self.assertEqual(
+                sum(1 for r in sessions if r.status == "CLOSED"), 1)
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_stale_evidence_invalidated_on_subsequent_failure(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            p1 = Provider(name="p1", base_url="http://a")
+            p2 = Provider(name="p2", base_url="http://b")
+            session.add_all([p1, p2])
+            session.commit()
+            session.refresh(p1)
+            session.refresh(p2)
+            m1 = Model(provider_id=p1.id, key="m1", name="m1")
+            m2 = Model(provider_id=p2.id, key="m2", name="m2")
+            session.add_all([m1, m2])
+            session.commit()
+            session.refresh(m1)
+            session.refresh(m2)
+            sess1 = SessionRow(provider_id=p1.id, model_id=m1.id,
+                               status="ACTIVE", start_at=now - 200_000,
+                               live_seen_at=now - 150_000)
+            sess2 = SessionRow(provider_id=p2.id, model_id=m2.id,
+                               status="ACTIVE", start_at=now - 200_000,
+                               live_seen_at=now - 150_000)
+            session.add_all([sess1, sess2])
+            session.commit()
+            collector = Collector(lambda _: None)
+            from observatory.collector import _PollEvidence
+            collector._startup_evidence[p1.id] = _PollEvidence(
+                provider_id=p1.id, gen=0, models_ok=True,
+                loaded_model_keys={"m1"},
+                slot_evidence={"m1": (True, set())})
+            # p1 fails: evidence cleared, gen incremented
+            collector._startup_evidence.clear()
+            collector._startup_gen += 1
+            # p2 succeeds with new gen
+            collector._startup_evidence[p2.id] = _PollEvidence(
+                provider_id=p2.id, gen=1, models_ok=True,
+                loaded_model_keys={"m2"},
+                slot_evidence={"m2": (True, set())})
+            # p1 not in evidence -> reconciliation should NOT run
+            self.assertFalse(
+                {p1.id, p2.id} <= set(collector._startup_evidence.keys()))
+            # Both sessions preserved
+            session.expire_all()
+            self.assertEqual(session.get(SessionRow, sess1.id).status, "ACTIVE")
+            self.assertEqual(session.get(SessionRow, sess2.id).status, "ACTIVE")
+
+    def test_only_newest_evidence_used_after_failure_recovery(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            p1 = Provider(name="p1", base_url="http://a")
+            session.add(p1)
+            session.commit()
+            session.refresh(p1)
+            m1 = Model(provider_id=p1.id, key="m1", name="m1")
+            session.add(m1)
+            session.commit()
+            session.refresh(m1)
+            sess = SessionRow(provider_id=p1.id, model_id=m1.id,
+                              status="ACTIVE", start_at=now - 200_000,
+                              live_seen_at=now - 150_000,
+                              source_slot_id=0, source_task_id=9)
+            session.add(sess)
+            session.commit()
+            collector = Collector(lambda _: None)
+            from observatory.collector import _PollEvidence
+            # gen 0: task present
+            collector._startup_evidence[p1.id] = _PollEvidence(
+                provider_id=p1.id, gen=0, models_ok=True,
+                loaded_model_keys={"m1"},
+                slot_evidence={"m1": (True, {(0, 9)})})
+            # failure: clear, gen -> 1
+            collector._startup_evidence.clear()
+            collector._startup_gen = 1
+            # gen 1: task absent
+            collector._startup_evidence[p1.id] = _PollEvidence(
+                provider_id=p1.id, gen=1, models_ok=True,
+                loaded_model_keys={"m1"},
+                slot_evidence={"m1": (True, set())})
+            # Only gen-1 evidence should be used
+            collector._reconcile_after_startup(
+                session, collector._startup_evidence, {p1.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "INTERRUPTED")
+
+    def test_models_cache_stale_when_current_call_fails(self):
+        engine = memory_engine()
+        now = int(time.time() * 1000)
+        with Session(engine) as session:
+            provider = Provider(name="router", base_url="http://router")
+            session.add(provider)
+            session.commit()
+            session.refresh(provider)
+            model = Model(provider_id=provider.id, key="m1", name="m1")
+            session.add(model)
+            session.commit()
+            session.refresh(model)
+            sess = SessionRow(provider_id=provider.id, model_id=model.id,
+                              status="ACTIVE", start_at=now - 200_000,
+                              live_seen_at=now - 150_000)
+            session.add(sess)
+            session.commit()
+            session.refresh(sess)
+            collector = Collector(lambda _: None)
+            from observatory.collector import _PollEvidence
+            # models_ok=False simulates /v1/models failing in this poll
+            evidence = {provider.id: _PollEvidence(
+                provider_id=provider.id, gen=0, models_ok=False,
+                loaded_model_keys=set(),
+                slot_evidence={})}
+            collector._reconcile_after_startup(
+                session, evidence, {provider.id})
+            session.expire_all()
+            row = session.get(SessionRow, sess.id)
+            self.assertEqual(row.status, "ACTIVE")
 
 
 if __name__ == "__main__":

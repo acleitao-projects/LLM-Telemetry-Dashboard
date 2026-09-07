@@ -35,6 +35,77 @@
 </div>
 
 <div class="set-section">
+  <h3>Model Pricing <span>USD per million tokens · one atomic bulk save per provider</span></h3>
+  <div class="panel" style="padding:8px 12px">
+    <div class="mp-toolbar">
+      <label for="mp_provider">Provider</label>
+      <select id="mp_provider" aria-describedby="mpStatus"></select>
+      <span class="muted" id="mpDirtyCount" style="font-size:11px"></span>
+      <button class="btn primary" id="mpSave" disabled>Bulk Save</button>
+    </div>
+    <div id="mpStatus" class="mp-status" role="status" aria-live="polite"></div>
+    <div class="muted" id="mpSyncLine" style="font-size:10.5px;margin:2px 0 6px"></div>
+    <div class="mp-scroll">
+      <table class="data-table mp-table">
+        <thead>
+          <tr><th scope="col">Model</th><th scope="col">Availability</th><th scope="col">Pricing</th><th scope="col">Last updated</th><th scope="col" class="num">Input USD/M</th><th scope="col" class="num">Output USD/M</th><th scope="col" class="num">Cache write USD/M</th><th scope="col" class="num">Cache read USD/M</th></tr>
+        </thead>
+        <tbody id="mpBody"></tbody>
+      </table>
+    </div>
+    <div class="muted" style="font-size:10.5px;margin-top:8px">Prices are per 1M tokens in USD — use a decimal point or comma (0.5 / 0,5). Blank clears a price (null). Zero is a valid explicit price. Offline and historical files stay editable. These fields stay in USD regardless of your secondary-currency setting. Editing any price switches that model to <b>manual</b> — the daily sync then leaves it alone until you switch it back to <b>auto</b>.</div>
+  </div>
+</div>
+
+<div class="set-section">
+  <h3>Automatic Pricing <span>once-daily USD rates from the LiteLLM catalog · USD stays authoritative</span></h3>
+  <div class="panel form-grid">
+    <div class="field"><label for="ap_enabled">Enabled</label>
+      <select id="ap_enabled"><option value="0">Off</option><option value="1">On</option></select>
+    </div>
+    <div class="field"><label for="ap_time">Daily run time (server local, HH:MM)</label>
+      <input type="text" id="ap_time" placeholder="04:00" inputmode="numeric" maxlength="5">
+    </div>
+    <div class="field"><label for="ap_match">Name matching via inference</label>
+      <select id="ap_match"><option value="0">Off — name tokens only</option><option value="1">On — ask a provider when ambiguous</option></select>
+    </div>
+    <div class="field"><label for="ap_provider">Matching provider</label>
+      <select id="ap_provider"><option value="">Default provider</option></select>
+    </div>
+    <div class="field"><label for="ap_model">Matching model</label>
+      <select id="ap_model"><option value="">First loaded model</option></select>
+    </div>
+    <div class="field" style="grid-column:1/-1"><label for="ap_prompt">Match prompt template</label>
+      <textarea id="ap_prompt" rows="8" spellcheck="false" style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:11px"></textarea>
+      <div class="muted" id="ap_prompt_err" style="font-size:10.5px;color:#d99a96"></div>
+      <div class="muted" style="font-size:10px">Must contain <code>{model_name}</code> and <code>{candidates}</code>. The reply only picks a catalog key — prices always come from the catalog, never from the model.</div>
+    </div>
+    <div class="field" style="justify-content:flex-end"><label style="visibility:hidden">.</label>
+      <button class="btn primary" id="ap_save">Save</button>
+    </div>
+    <div class="field" style="justify-content:flex-end"><label style="visibility:hidden">.</label>
+      <button class="btn" id="ap_restore_prompt">Restore default prompt</button>
+    </div>
+    <div class="field" style="justify-content:flex-end"><label style="visibility:hidden">.</label>
+      <button class="btn" id="ap_run">Run now</button>
+    </div>
+    <div class="field" style="grid-column:1/-1">
+      <div class="muted" id="ap_status" style="font-size:10.5px">Off — model prices are only what you set by hand.</div>
+    </div>
+  </div>
+  <div class="panel" style="padding:8px 12px;margin-top:10px">
+    <div class="muted" style="font-size:10.5px;margin-bottom:6px">Recent runs <span style="opacity:.7">(kept indefinitely)</span></div>
+    <div class="mp-scroll">
+      <table class="data-table">
+        <thead><tr><th>Started</th><th>Trigger</th><th>Result</th><th class="num">Updated</th><th class="num">Skipped</th><th class="num">Unresolved</th><th class="num">Failed</th><th>Notes</th></tr></thead>
+        <tbody id="ap_runs"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="muted" style="font-size:10.5px;margin-top:8px">Source: <code>BerriAI/litellm</code> <code>model_prices_and_context_window.json</code> (MIT). An aggregator, not a first-party vendor page — the source SHA and fetch time are recorded per model. Manual prices are never touched. A failed or empty fetch keeps the last good rate and marks it stale.</div>
+</div>
+
+<div class="set-section">
   <h3>Display <span>defaults applied on the Models page</span></h3>
   <div class="panel form-grid">
     <div class="field"><label>Default range</label>
@@ -50,10 +121,26 @@
       </select>
     </div>
     <div class="field"><label>Theme</label>
-      <select id="d_theme"><option value="dark">dark</option></select>
+      <select id="d_theme"><option value="dark">dark</option><option value="light">light</option></select>
     </div>
     <div class="field" style="justify-content:flex-end"><label style="visibility:hidden">.</label>
       <button class="btn primary" id="btnSaveDisp">Save display settings</button>
     </div>
   </div>
+</div>
+
+<div class="set-section">
+  <h3>Secondary currency <span>display-only conversion · USD stays authoritative</span></h3>
+  <div class="panel form-grid">
+    <div class="field"><label for="cur_code">Currency</label>
+      <select id="cur_code"><option value="">Off</option></select>
+    </div>
+    <div class="field" style="justify-content:flex-end"><label style="visibility:hidden">.</label>
+      <button class="btn" id="cur_refresh">Refresh rate</button>
+    </div>
+    <div class="field" style="grid-column:1/-1">
+      <div class="muted" id="cur_status" style="font-size:10.5px">Off — costs are shown in USD only.</div>
+    </div>
+  </div>
+  <div class="muted" style="font-size:10.5px;margin-top:8px">One rate, refreshed once a day from Frankfurter (ECB). Stored prices, token history and session history are never rewritten — this only changes what cards and tables display. Pick a currency and the rate normally arrives within seconds.</div>
 </div>

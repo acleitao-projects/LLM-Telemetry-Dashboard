@@ -11,17 +11,20 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import and_, func, or_
 from sqlmodel import Session, delete, select
 
 from . import database as db
 from .llama_provider import (AgentClient, config_fingerprint,
-                             extract_config, map_metrics)
-from .metrics import next_model_color, parse_model_name
+                              extract_config, map_metrics)
+from .metrics import FINALIZING_FRESH_MS, LIVE_FRESH_MS, next_model_color, parse_model_name
 from .models import (BuildInfo, CollectorLease, GpuTelemetrySample, HardwareInfo, Model,
-                     ModelConfig, Provider, SessionRow, TelemetrySample, now_ms)
+                      ModelConfig, ModelResidency, ModelUsageBucket, Provider, SessionRow,
+                      TelemetrySample, now_ms)
 from .settings import (AGENT_POLL_S, BUCKET_FULL_S, BUCKET_MID_S, LLAMA_POLL_S,
                         MODELS_POLL_S, PROPS_POLL_S, QUANT_TOKENS, RETENTION_FULL_S,
                         RETENTION_MID_S, RETENTION_RAW_S, RETENTION_SWEEP_S,
@@ -41,6 +44,22 @@ LIVE_SPEED_WINDOW_S = 8.0
 LIVE_SHORT_WINDOW_S = 3.0
 LEASE_STALE_MS = 10_000
 LEASE_RETRY_S = 2.0
+# P06: while the lease is held and ownership is certain, refresh the heartbeat
+# at most this often.  Must stay comfortably below LEASE_STALE_MS so that a
+# genuine owner crash is still detected (and taken over) within the stale
+# window: worst observed gap is LEASE_HEARTBEAT_S + one tick, ~4s of 10s.
+LEASE_HEARTBEAT_S = 3.0
+RECONCILE_GRACE_MS = 120_000
+
+
+@dataclass
+class _PollEvidence:
+    """Authoritative evidence from one successful poll of a provider."""
+    provider_id: int
+    gen: int
+    models_ok: bool
+    loaded_model_keys: set
+    slot_evidence: dict
 
 
 def _phase_duration(token_delta: float, seconds_delta: float,
@@ -184,7 +203,7 @@ def _model_entries(mlist: list) -> list[dict]:
 
 
 def model_entry_config(entry: dict) -> dict:
-    """Build a config dict from a router /v1/models entry (args + meta)."""
+    """Build a config dict from a multi-model router /v1/models entry (args + meta)."""
     cfg: dict = {}
     args = entry.get("args") or []
     if args:
@@ -242,12 +261,41 @@ class Collector:
         self._last_models: dict[int, float] = {}
         self._last_agent: dict[int, float] = {}
         self._last_retention = time.time()
+        self._retention_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.started_at = time.time()
         self.owner_id = str(uuid.uuid4())
         self.role = "standby"
         self._last_lease_attempt = 0.0
+        # P06: wall-clock timestamp of the last *verified* successful lease
+        # heartbeat.  0.0 means "no successful heartbeat yet" — ownership can
+        # never be assumed from initialization.  It is set only after a
+        # confirmed UPSERT/ownership check and reset to 0.0 whenever
+        # ownership is lost or becomes uncertain (failure, standby, release).
+        self._last_heartbeat = 0.0
+        self._startup_evidence: dict[int, _PollEvidence] = {}
+        self._startup_gen: int = 0
+        self._reconciled: bool = False
+        # Monotonic generation of the persisted usage data. Bumped when the
+        # data generation relevant to range_summary changes (minute rollover,
+        # session close, model state change, retention) so the snapshot
+        # registry can revalidate without being invalidated on every poll.
+        self.data_generation = 0
+        self._data_gen_lock = threading.Lock()
+        self._last_gen_minute: int = 0
+
+    def _bump_data_generation(self) -> None:
+        with self._data_gen_lock:
+            self.data_generation += 1
+
+    def _bump_data_generation_minute(self, ts_ms: int) -> None:
+        """Bump data_generation at most once per calendar minute."""
+        minute = ts_ms // 60_000
+        with self._data_gen_lock:
+            if minute != self._last_gen_minute:
+                self._last_gen_minute = minute
+                self.data_generation += 1
 
     # ------------------------------------------------------------------ life
     def start(self):
@@ -261,6 +309,8 @@ class Collector:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
+        if self._retention_thread:
+            self._retention_thread.join(timeout=5)
         for c in list(self.clients.values()):
             try:
                 c.close()
@@ -281,9 +331,84 @@ class Collector:
                 item["slots"] = False
         return out
 
-    def _ensure_lease(self, now: float) -> bool:
-        if self.role != "active" and now - self._last_lease_attempt < LEASE_RETRY_S:
+    def _reconcile_after_startup(self, s: Session,
+                                 evidence: dict[int, _PollEvidence],
+                                 provider_ids: set[int]):
+        """Terminalize stale sessions using authoritative poll evidence.
+
+        Only runs after every enabled provider has a successful poll in the
+        current startup generation.  A session is terminalized only when the
+        source poll explicitly proves the task is absent.
+        """
+        now_ms_val = int(time.time() * 1000)
+        grace_cutoff = now_ms_val - RECONCILE_GRACE_MS
+        stale = list(s.exec(select(SessionRow).where(
+            SessionRow.status.in_(["ACTIVE", "FINALIZING"]),
+            SessionRow.provider_id.in_(provider_ids),
+            or_(
+                and_(SessionRow.live_seen_at.isnot(None),
+                     SessionRow.live_seen_at < grace_cutoff),
+                and_(SessionRow.live_seen_at.is_(None),
+                     SessionRow.start_at < grace_cutoff),
+            ),
+        )).all())
+        changed = 0
+        for row in stale:
+            ev = evidence.get(row.provider_id)
+            if ev is None:
+                continue
+            if not self._authoritative_absence(s, row, ev):
+                continue
+            status = "INTERRUPTED" if row.status == "ACTIVE" else "INCOMPLETE"
+            row.status = status
+            row.result_source = "incomplete" if status == "INCOMPLETE" else "interrupted"
+            if (row.live_seen_at is not None and row.start_at is not None
+                    and row.live_seen_at >= row.start_at):
+                computed = (row.live_seen_at - row.start_at) / 1000.0
+                if computed > 0 or (row.prompt_tokens + row.gen_tokens) == 0:
+                    row.end_at = row.live_seen_at
+                    row.duration_s = round(computed, 1)
+            s.add(row)
+            changed += 1
+        if changed:
+            s.commit()
+            log.info("startup reconciliation: %d stale sessions terminalized",
+                     changed)
+
+    def _authoritative_absence(self, s: Session, row: SessionRow,
+                               ev: _PollEvidence) -> bool:
+        """Return True only when poll evidence positively proves the task is absent."""
+        if row.model_id is None:
             return False
+        model = s.get(Model, row.model_id)
+        if model is None:
+            return False
+        mk = model.key
+        if mk not in ev.loaded_model_keys:
+            return ev.models_ok
+        slot_ev = ev.slot_evidence.get(mk)
+        if slot_ev is None:
+            return False
+        slots_ok, active_tasks = slot_ev
+        if not slots_ok:
+            return False
+        if row.source_slot_id is not None and row.source_task_id is not None:
+            return (row.source_slot_id, row.source_task_id) not in active_tasks
+        return len(active_tasks) == 0
+
+    def _ensure_lease(self, now: float) -> bool:
+        if self.role != "active":
+            # Standby / takeover-retry: never assume ownership from cached
+            # state.  Reset any stale fast-path timestamp and fall through to
+            # the real UPSERT (rate-limited by LEASE_RETRY_S).
+            self._last_heartbeat = 0.0
+            if now - self._last_lease_attempt < LEASE_RETRY_S:
+                return False
+        elif now - self._last_heartbeat < LEASE_HEARTBEAT_S:
+            # P06 fast path: ownership was verified recently and has not
+            # become uncertain (no failure, no release, no standby transition
+            # since).  Skip the UPSERT+commit entirely.
+            return True
         self._last_lease_attempt = now
         heartbeat = int(now * 1000)
         cutoff = heartbeat - LEASE_STALE_MS
@@ -300,11 +425,20 @@ class Collector:
             s.commit()
             row = s.get(CollectorLease, "collector")
             acquired = bool(row and row.owner_id == self.owner_id)
-        self.role = "active" if acquired else "standby"
+        if acquired:
+            # Only a *verified* ownership check may arm the fast path.
+            self._last_heartbeat = now
+            self.role = "active"
+        else:
+            # Ownership lost or contested: force a real DB round trip on the
+            # next attempt until ownership is re-verified.
+            self._last_heartbeat = 0.0
+            self.role = "standby"
         return acquired
 
     def _release_lease(self):
         if self.role != "active":
+            self._last_heartbeat = 0.0
             return
         try:
             with db.new_session() as s:
@@ -315,6 +449,7 @@ class Collector:
         except Exception:
             log.exception("failed releasing collector lease")
         self.role = "standby"
+        self._last_heartbeat = 0.0
 
     # ----------------------------------------------------------------- loop
     def _loop(self):
@@ -328,10 +463,23 @@ class Collector:
             time.sleep(max(0.2, min(0.6, 0.6 - elapsed)))
             if t0 - self._last_retention > RETENTION_SWEEP_S:
                 self._last_retention = t0
-                try:
-                    run_retention()
-                except Exception:
-                    log.exception("retention sweep failed")
+                self._start_retention()
+
+    def _start_retention(self) -> None:
+        """Run at most one retention pass without stopping provider polling."""
+        if self._retention_thread and self._retention_thread.is_alive():
+            return
+
+        def _run() -> None:
+            try:
+                run_retention()
+                self._bump_data_generation()
+            except Exception:
+                log.exception("retention sweep failed")
+
+        self._retention_thread = threading.Thread(
+            target=_run, name="retention", daemon=True)
+        self._retention_thread.start()
 
     def _tick(self):
         now = time.time()
@@ -355,6 +503,17 @@ class Collector:
                     self._poll(p, st, now)
                 except Exception as e:
                     self._poll_fail(p, st, e)
+                    if not self._reconciled:
+                        self._startup_evidence.clear()
+                        self._startup_gen += 1
+            if not self._reconciled and pids:
+                if pids <= set(self._startup_evidence.keys()):
+                    if all(self._startup_evidence[pid].gen == self._startup_gen
+                           for pid in pids):
+                        if self._ensure_lease(time.time()):
+                            self._reconcile_after_startup(
+                                s, self._startup_evidence, pids)
+                            self._reconciled = True
 
     def _drop_provider(self, pid: int):
         ts = int(time.time() * 1000)
@@ -367,6 +526,9 @@ class Collector:
                         self._end_live_tasks(s, st_m, ts, "INTERRUPTED")
                     elif st_m.active_session_id:
                         self._close_session(s, st_m, ts)
+                    self._close_residency(s, pid, st_m.model_id, ts)
+                s.commit()
+                self._bump_data_generation()
         except Exception:
             log.exception("failed closing sessions on provider drop")
         self.states.pop(pid, None)
@@ -432,12 +594,24 @@ class Collector:
             except Exception:
                 props = {}
             self._last_props[p.id] = now
+        models_ok = False
+        catalog_refresh = False
         if now - self._last_models.get(p.id, 0) >= MODELS_POLL_S:
             try:
                 self._model_cache[p.id] = client.models() or []
+                models_ok = True
+                catalog_refresh = True
             except Exception:
-                pass
+                models_ok = False
             self._last_models[p.id] = now
+        else:
+            # P06: distinguish "fresh catalog data fetched this tick"
+            # (catalog_refresh: full upsert + G03 change detection) from
+            # "serving a cached /v1/models payload" (models_ok: identity
+            # reuse, no catalog writes).  Previously every tick re-ran the
+            # full model upsert + availability scans even though the payload
+            # only changes on the MODELS_POLL_S cadence.
+            models_ok = self._model_cache.get(p.id) is not None
         entries = _model_entries(self._model_cache.get(p.id) or [])
         if not entries:
             mi = props.get("model_info") or {}
@@ -476,21 +650,58 @@ class Collector:
             loaded_count = 0
             metrics_ok = 0
             metrics_errors: list[str] = []
+            # G03: capture pre-refresh catalog availability for change
+            # detection (only meaningful on catalog-refresh ticks; on cached
+            # ticks the catalog cannot have changed under us).
+            _pre_avail_keys = {row.key for row in s.exec(select(Model).where(
+                Model.provider_id == provider.id,
+                Model.catalog_available == True,  # noqa: E712
+            )).all()} if catalog_refresh else None
             for entry in entries:
                 st_m = self.model_states.get((provider.id, entry["key"]))
+                # P06: on catalog-refresh ticks the upsert already resolved the
+                # Model row; hand it to _poll_model so the hot path can skip
+                # its own lookup.  Between refreshes the cached identity in
+                # st_m (verified at most MODELS_POLL_S ago) is reused.
+                refreshed = None
+                if catalog_refresh:
+                    refreshed = self._upsert_model_entry(s, provider, entry,
+                                                         props, ts_ms)
                 if entry["loaded"]:
                     loaded_count += 1
                     error = self._poll_model(s, provider, entry, props, st_m, client,
-                                             health, agent_data, ts_ms, now)
+                                             health, agent_data, ts_ms, now,
+                                             refreshed=refreshed,
+                                             identity_fresh=catalog_refresh)
                     if error:
                         metrics_errors.append(error)
                     else:
                         metrics_ok += 1
                 elif st_m is not None and (st_m.was_loaded or st_m.active_session_id):
                     self._unload_model(s, provider, entry, st_m, ts_ms)
+            # G03: mark previously-known models absent from this refresh as unavailable.
+            # A successful /v1/models with zero entries is still authoritative:
+            # every previously-available model becomes unavailable.
+            if catalog_refresh:
+                self._mark_absent_catalog_models(s, provider, known_keys)
+            # G03: detect meaningful catalog changes and invalidate snapshots.
+            # Only bump when the set of catalog-available keys actually changed
+            # (new model, disappeared, or reappeared) — not on timestamp-only refreshes.
+            if catalog_refresh:
+                _post_avail_keys = {row.key for row in s.exec(select(Model).where(
+                    Model.provider_id == provider.id,
+                    Model.catalog_available == True,  # noqa: E712
+                )).all()}
+                if _post_avail_keys != _pre_avail_keys:
+                    self._bump_data_generation()
             for k in [k for k in self.model_states
                       if k[0] == provider.id and k[1] not in known_keys]:
                 st_m = self.model_states.pop(k)
+                # P06 drive-by fix (pre-existing on main): _close_residency
+                # expects (provider_id: int, model_id: int); passing the
+                # Provider object here crashed whenever a model key vanished
+                # from the catalog.
+                self._close_residency(s, provider.id, st_m.model_id, ts_ms)
                 if st_m.live_tasks:
                     self._end_live_tasks(s, st_m, ts_ms, "INCOMPLETE")
                 elif st_m.active_session_id:
@@ -510,8 +721,22 @@ class Collector:
             provider.status = "LIVE"
             provider.last_error = "; ".join(metrics_errors)[:300] if metrics_errors else None
             s.commit()
+        self._bump_data_generation_minute(ts_ms)
 
         st.last_ts = now
+        if not self._reconciled:
+            self._startup_evidence[p.id] = _PollEvidence(
+                provider_id=p.id,
+                gen=self._startup_gen,
+                models_ok=models_ok,
+                loaded_model_keys={e["key"] for e in entries if e["loaded"]},
+                slot_evidence={
+                    mk2: (st2.slots_available is True,
+                          {(t.slot_id, t.task_id) for t in st2.live_tasks.values()})
+                    for (pid2, mk2), st2 in self.model_states.items()
+                    if pid2 == p.id and st2.was_loaded
+                },
+            )
 
     def _poll_fail(self, p: Provider, st: ProviderState, err: Exception):
         st.fail_streak += 1
@@ -535,16 +760,64 @@ class Collector:
                         self._end_live_tasks(s, st_m, now_ms_v, "INTERRUPTED")
                     elif st_m.active_session_id:
                         self._close_session(s, st_m, now_ms_v)
+                    self._close_residency(s, p.id, st_m.model_id, now_ms_v)
+                    # P06: provider went OFFLINE — the server may have come
+                    # back with different models; drop cached identities so
+                    # the next successful poll re-resolves them.
+                    st_m.model_key = None
+                    st_m.model_id = None
             provider.fail_streak = st.fail_streak
             provider.last_error = str(err)[:300]
             s.commit()
+        self._bump_data_generation()
         log.warning("provider %s poll failed: %s", p.name, err)
 
     # ------------------------------------------------------------- per-model
+    def _touch_residency(self, s: Session, provider: Provider, model_id: int, ts_ms: int):
+        """Open (or touch) the single open residency interval for a loaded model."""
+        if model_id is None:
+            return
+        open_row = s.exec(select(ModelResidency).where(
+            ModelResidency.provider_id == provider.id,
+            ModelResidency.model_id == model_id,
+            ModelResidency.unloaded_at.is_(None),
+        )).first()
+        if open_row is None:
+            s.add(ModelResidency(provider_id=provider.id, model_id=model_id,
+                                 loaded_at=ts_ms, last_seen_at=ts_ms,
+                                 source="collector"))
+        else:
+            open_row.last_seen_at = max(open_row.last_seen_at or 0, ts_ms)
+            s.add(open_row)
+
+    def _close_residency(self, s: Session, provider_id: int, model_id: Optional[int],
+                         ts_ms: int):
+        """Close the open residency interval for a model (idempotent)."""
+        if model_id is None:
+            return
+        open_row = s.exec(select(ModelResidency).where(
+            ModelResidency.provider_id == provider_id,
+            ModelResidency.model_id == model_id,
+            ModelResidency.unloaded_at.is_(None),
+        )).first()
+        if open_row is not None:
+            open_row.unloaded_at = ts_ms
+            open_row.last_seen_at = max(open_row.last_seen_at or 0, ts_ms)
+            s.add(open_row)
+
     def _poll_model(self, s: Session, provider: Provider, entry: dict, props: dict,
                     st_m: ProviderState, client, health: dict, agent_data: dict,
-                    ts_ms: int, now: float) -> Optional[str]:
-        """One scrape for a loaded model: /metrics?model=<key> + samples."""
+                    ts_ms: int, now: float, refreshed: Optional[Model] = None,
+                    identity_fresh: bool = False) -> Optional[str]:
+        """One scrape for a loaded model: /metrics?model=<key> + samples.
+
+        P06: ``refreshed`` is the Model row resolved by the catalog-refresh
+        upsert (``identity_fresh`` True on those ticks).  Between catalog
+        refreshes the stable identity cached in ``st_m`` is trusted instead of
+        re-SELECTing the Model row every poll.  The cache is bounded by
+        MODELS_POLL_S and invalidated on key mismatch, poll failure, provider
+        drop, and unloading.
+        """
         mk = entry["key"]
         if st_m is None:
             st_m = self.model_states[(provider.id, mk)] = ProviderState()
@@ -557,9 +830,26 @@ class Collector:
         st_m.metrics_fail = 0
         mapped = map_metrics(raw_metrics)
 
-        model = self._upsert_model_entry(s, provider, entry, props)
+        if refreshed is not None:
+            # Authoritative row from this tick's catalog-refresh upsert.
+            model = refreshed
+            cached_id = None
+        elif (st_m.model_key == mk and st_m.model_id is not None
+                and not identity_fresh):
+            # Cached identity: key still matches the entry and no newer
+            # catalog information is available, so the id resolved by the
+            # last catalog refresh (at most MODELS_POLL_S old) is still
+            # valid.  No Model SELECT is needed on this hot path; callers
+            # below only need the id.
+            cached_id = st_m.model_id
+            model = None
+        else:
+            cached_id = None
+            model = None
+        if model is None and cached_id is None:
+            model = self._upsert_model_entry(s, provider, entry, props)
         st_m.model_key = mk
-        st_m.model_id = model.id
+        st_m.model_id = cached_id if cached_id is not None else model.id
         st_m.was_loaded = True
 
         # configuration (history preserving)
@@ -577,7 +867,7 @@ class Collector:
                     merged["flags_raw"] = argv
                 cfg = merged
         if cfg:
-            self._upsert_model_config(s, st_m, model, cfg)
+            self._upsert_model_config(s, st_m, st_m.model_id, cfg)
 
         slots: list[dict] = []
         try:
@@ -596,6 +886,36 @@ class Collector:
         d_gen_s = safe_delta(cur, "gen_seconds_total", st_m.prev)
         d_prop = safe_delta(cur, "mtp_proposed_total", st_m.prev)
         d_acc = safe_delta(cur, "mtp_accepted_total", st_m.prev)
+        d_tokens = safe_delta(cur, "tokens_total", st_m.prev)
+        # G02: while loaded, keep the single open residency interval current and
+        # record this observation's positive deltas in the durable minute bucket.
+        # Counter resets yield zero deltas (new baseline) and never subtract.
+        self._touch_residency(s, provider, st_m.model_id, ts_ms)
+        minute = (ts_ms // 60_000) * 60_000
+        if st_m.model_id and (d_tokens or d_prompt or d_gen or d_prompt_s or
+                              d_gen_s or d_prop or d_acc):
+            uncl = max(0.0, d_tokens - d_prompt - d_gen)
+            s.execute(sqlite_insert(ModelUsageBucket).values(
+                provider_id=provider.id, model_id=st_m.model_id,
+                bucket_start=minute,
+                input_tokens=d_prompt, output_tokens=d_gen,
+                unclassified_tokens=uncl, prompt_time_s=d_prompt_s,
+                gen_time_s=d_gen_s, mtp_proposed=d_prop, mtp_accepted=d_acc,
+                first_observed_at=ts_ms, last_observed_at=ts_ms,
+                estimated=False, provenance="collector",
+            ).on_conflict_do_update(
+                index_elements=["provider_id", "model_id", "bucket_start"],
+                set_={
+                    "input_tokens": ModelUsageBucket.input_tokens + d_prompt,
+                    "output_tokens": ModelUsageBucket.output_tokens + d_gen,
+                    "unclassified_tokens": ModelUsageBucket.unclassified_tokens + uncl,
+                    "prompt_time_s": ModelUsageBucket.prompt_time_s + d_prompt_s,
+                    "gen_time_s": ModelUsageBucket.gen_time_s + d_gen_s,
+                    "mtp_proposed": ModelUsageBucket.mtp_proposed + d_prop,
+                    "mtp_accepted": ModelUsageBucket.mtp_accepted + d_acc,
+                    "first_observed_at": func.min(ModelUsageBucket.first_observed_at, ts_ms),
+                    "last_observed_at": func.max(ModelUsageBucket.last_observed_at, ts_ms),
+                }))
 
         prompt_tps = mapped.get("prompt_tps")
         gen_tps = mapped.get("gen_tps")
@@ -623,8 +943,7 @@ class Collector:
                 live_seen_at=ts_ms, mtp_enabled=bool(cfg.get("mtp_enabled")),
             )
             s.add(sess)
-            s.commit()
-            s.refresh(sess)
+            s.flush()
             st_m.active_session_id = sess.id
             st_m.stats = SessionStats()
         if slots_busy and st_m.active_session_id:
@@ -632,7 +951,6 @@ class Collector:
             if busy_session:
                 busy_session.live_seen_at = ts_ms
                 s.add(busy_session)
-                s.commit()
             st_m.last_activity_ts = now
         # sessions
         if reset:
@@ -659,8 +977,7 @@ class Collector:
                     mtp_enabled=bool(cfg.get("mtp_enabled")) or (d_prop > 0),
                 )
                 s.add(sess)
-                s.commit()
-                s.refresh(sess)
+                s.flush()
                 st_m.active_session_id = sess.id
                 st_m.stats = SessionStats()
                 st_m.first_gen_ts = None
@@ -710,7 +1027,6 @@ class Collector:
             if observed_session:
                 observed_session.result_source = "metrics"
                 s.add(observed_session)
-                s.commit()
             finalizing = [key for key, task in st_m.live_tasks.items()
                           if task.finalizing_since is not None and
                           task.session_id == st_m.active_session_id]
@@ -719,7 +1035,6 @@ class Collector:
                 if sess:
                     sess.result_source = "metrics"
                     s.add(sess)
-                    s.commit()
                 self._close_session(s, st_m, ts_ms)
                 st_m.live_tasks.pop(finalizing[0], None)
 
@@ -758,9 +1073,20 @@ class Collector:
         )
         s.add(sample)
 
-        if activity or state in ("IDLE", "PROMPTING", "GENERATING"):
-            model.last_used_at = ts_ms
-            model.first_seen_at = model.first_seen_at or ts_ms
+        # P06: first_seen_at is a create-time one-shot (already set on every
+        # persisted row); only touch the ORM instance on catalog-refresh
+        # ticks.  Activity freshness for last_used_at is preserved with a
+        # targeted PK UPDATE that rides the commit the sample insert already
+        # forces — no extra SELECT and no extra commit.
+        if refreshed is not None:
+            refreshed.first_seen_at = refreshed.first_seen_at or ts_ms
+        if activity:
+            if refreshed is not None:
+                refreshed.last_used_at = ts_ms
+            else:
+                s.execute(Model.__table__.update()
+                          .where(Model.id == st_m.model_id)
+                          .values(last_used_at=ts_ms))
 
         st_m.last_ts = now
         return None
@@ -790,8 +1116,7 @@ class Collector:
                         mtp_enabled=bool(cfg.get("mtp_enabled")),
                     )
                     s.add(row)
-                    s.commit()
-                    s.refresh(row)
+                    s.flush()
                 task = LiveTaskState(
                     slot_id=snap["slot_id"], task_id=snap["task_id"],
                     session_id=row.id, first_seen=now, last_seen=now,
@@ -881,7 +1206,7 @@ class Collector:
         elif st.active_session_id and st.slots_available:
             st.active_session_id = None
             st.stats = None
-        s.commit()
+        s.flush()
 
     @staticmethod
     def _stats_from_session(row: SessionRow) -> SessionStats:
@@ -909,6 +1234,7 @@ class Collector:
         if model is not None:
             s.add(TelemetrySample(provider_id=provider.id, model_id=model.id,
                                   ts=ts_ms, state="UNLOADED"))
+        self._close_residency(s, provider.id, st_m.model_id, ts_ms)
         st_m.prev = {}
         st_m.last_ts = None
         st_m.was_loaded = False
@@ -916,6 +1242,10 @@ class Collector:
         st_m.mtp_window = []
         st_m.live_tasks.clear()
         st_m.slots_available = None
+        # P06: the identity cache is only meaningful while the model is
+        # loaded; force a fresh authoritative lookup on the next load.
+        st_m.model_key = None
+        st_m.model_id = None
 
     def _end_live_tasks(self, s: Session, st: ProviderState, end_ts_ms: int,
                         status: str):
@@ -935,7 +1265,7 @@ class Collector:
         st.last_activity_ts = None
         st.prompt_phase_start_ts = None
         st.first_gen_ts = None
-        s.commit()
+        s.flush()
 
     def _store_router_props(self, s: Session, provider: Provider, props: dict):
         """Router-level /props: persist build_info as a BuildInfo row."""
@@ -963,8 +1293,19 @@ class Collector:
         s.add(row)
 
     # ---------------------------------------------------------------- models
+    def _mark_absent_catalog_models(self, s: Session, provider: Provider,
+                                    known_keys: set) -> None:
+        """Mark catalog models that vanished from this refresh as unavailable (G03)."""
+        absent = s.exec(select(Model).where(
+            Model.provider_id == provider.id,
+            Model.catalog_available == True,  # noqa: E712
+            ~Model.key.in_(list(known_keys)),
+        )).all()
+        for m_row in absent:
+            m_row.catalog_available = False
+
     def _upsert_model_entry(self, s: Session, provider: Provider, entry: dict,
-                            props: dict) -> Model:
+                            props: dict, ts_ms: int | None = None) -> Model:
         """Create/update the Model row for a /v1/models entry (any status)."""
         key = entry["key"]
         m = s.exec(select(Model).where(
@@ -984,10 +1325,11 @@ class Collector:
                 provider_id=provider.id, key=key, name=name,
                 quant=fquant or quant, family=fam, arch=arch, params=params,
                 color=next_model_color(s, provider.id),
+                catalog_available=True,
+                catalog_last_seen_at=ts_ms,
             )
             s.add(m)
-            s.commit()
-            s.refresh(m)
+            s.flush()
         else:
             changed = False
             if (fquant or quant) and m.quant is None:
@@ -1007,23 +1349,28 @@ class Collector:
                 if clean:
                     m.family = clean
                     changed = True
+            if not m.catalog_available:
+                m.catalog_available = True
+                changed = True
+            if ts_ms is not None:
+                m.catalog_last_seen_at = ts_ms
+                changed = True
             if changed:
-                s.commit()
-                s.refresh(m)
+                s.flush()
         return m
 
-    def _upsert_model_config(self, s: Session, st_m: ProviderState, model: Model,
-                             cfg: dict):
+    def _upsert_model_config(self, s: Session, st_m: ProviderState,
+                             model_id: int, cfg: dict):
         fp = config_fingerprint(cfg)
         if st_m.config_fp == fp and st_m.config_id:
             return
         row = s.exec(select(ModelConfig).where(
-            ModelConfig.model_id == model.id,
+            ModelConfig.model_id == model_id,
             ModelConfig.fingerprint == fp,
         )).first()
         if row is None:
             row = ModelConfig(
-                model_id=model.id, fingerprint=fp, payload=json.dumps(cfg, default=str),
+                model_id=model_id, fingerprint=fp, payload=json.dumps(cfg, default=str),
                 context=_opt_int(cfg.get("context")), kv_cache_k=cfg.get("kv_cache_k"),
                 kv_cache_v=cfg.get("kv_cache_v"),
                 flash_attn=cfg.get("flash_attn"), parallel=cfg.get("parallel"),
@@ -1037,8 +1384,7 @@ class Collector:
                 mtp_model=cfg.get("mtp_model"), speculative=cfg.get("speculative"),
             )
             s.add(row)
-            s.commit()
-            s.refresh(row)
+            s.flush()
         st_m.config_id = row.id
         st_m.config_fp = fp
         st_m.config_payload = cfg
@@ -1081,7 +1427,7 @@ class Collector:
             sess.ram_used_mb = stats.ram_used_mb_sum / stats.ram_used_mb_n
         if stats.power_w_n:
             sess.power_w = stats.power_w_sum / stats.power_w_n
-        s.commit()
+        s.flush()
 
     def _close_session(self, s: Session, st: ProviderState, end_ts_ms: int):
         sess_id = st.active_session_id
@@ -1109,7 +1455,7 @@ class Collector:
         st.last_activity_ts = None
         st.prompt_phase_start_ts = None
         st.first_gen_ts = None
-        s.commit()
+        s.flush()
 
     # ----------------------------------------------------------------- agent
     def _store_agent(self, s: Session, provider: Provider, data: dict, ts_ms: int):
@@ -1133,11 +1479,11 @@ class Collector:
                 pcie=gpu.get("pcie"), source="agent",
             )
             s.add(row)
-            s.commit()
+            s.flush()
         elif hw is not None:
             hw.gpus = json.dumps(gpu.get("gpus") or [])
             hw.last_seen_at = now_ms()
-            s.commit()
+            s.flush()
 
         active_models = sorted({st.model_id for (pid, _), st in self.model_states.items()
                                 if pid == provider.id and st.was_loaded and st.model_id})
@@ -1178,7 +1524,7 @@ class Collector:
                     b.version = identity["version"]
                 if not b.commit:
                     b.commit = identity["commit"]
-        s.commit()
+        s.flush()
 
 
 def _sig_of(hw: HardwareInfo) -> str:
@@ -1285,7 +1631,8 @@ def _bucketize(s: Session, old_cut: int, new_cut: int, bucket_ms: int):
     if pending is None:
         return
     rows = s.exec(select(TelemetrySample).where(
-        TelemetrySample.ts >= old_cut, TelemetrySample.ts < new_cut)).all()
+        TelemetrySample.ts >= old_cut, TelemetrySample.ts < new_cut,
+        (TelemetrySample.ts % bucket_ms) != 0)).all()
     if not rows:
         return
     groups: dict[tuple, list[TelemetrySample]] = {}
@@ -1345,7 +1692,8 @@ def _bucketize_gpu(s: Session, old_cut: int, new_cut: int, bucket_ms: int):
     if pending is None:
         return
     rows = s.exec(select(GpuTelemetrySample).where(
-        GpuTelemetrySample.ts >= old_cut, GpuTelemetrySample.ts < new_cut)).all()
+        GpuTelemetrySample.ts >= old_cut, GpuTelemetrySample.ts < new_cut,
+        (GpuTelemetrySample.ts % bucket_ms) != 0)).all()
     groups: dict[tuple, list[GpuTelemetrySample]] = {}
     for row in rows:
         bucket = (row.ts // bucket_ms) * bucket_ms
